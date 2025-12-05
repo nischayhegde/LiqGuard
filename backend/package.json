@@ -7,6 +7,8 @@
   "scripts": {
     "monitor": "tsx monitor.ts",
     "log-sol": "tsx sol_price_logger.ts",
+    "get-accounts": "tsx getProgramAccounts.ts",
+    "get-accounts-json": "tsx getProgramAccounts.ts --json",
     "build": "tsc",
     "dev": "tsx watch monitor.ts"
   },

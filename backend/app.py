@@ -392,6 +392,103 @@ def get_active_policies():
             'count': len(active_policies)
         }), 200
 
+@app.route('/program-accounts', methods=['GET'])
+def get_program_accounts():
+    """Get all Policy accounts from the Solana program with strike prices"""
+    import subprocess
+    import os
+    
+    try:
+        # Get the backend directory path
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(backend_dir, 'getProgramAccounts.ts')
+        
+        # Run the TypeScript script with JSON output
+        result = subprocess.run(
+            ['npm', 'run', 'get-accounts-json'],
+            cwd=backend_dir,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            return jsonify({
+                'error': 'Failed to fetch program accounts',
+                'details': result.stderr
+            }), 500
+        
+        # Parse JSON output
+        import json
+        data = json.loads(result.stdout)
+        
+        return jsonify(data), 200
+        
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Request timeout'}), 504
+    except json.JSONDecodeError as e:
+        return jsonify({
+            'error': 'Failed to parse response',
+            'details': str(e),
+            'output': result.stdout if 'result' in locals() else None
+        }), 500
+    except Exception as e:
+        return jsonify({
+            'error': 'Error fetching program accounts',
+            'details': str(e)
+        }), 500
+
+@app.route('/strike-prices', methods=['GET'])
+def get_strike_prices():
+    """Get only strike prices from all Policy accounts"""
+    import subprocess
+    import os
+    import json
+    
+    try:
+        # Get the backend directory path
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Run the TypeScript script with JSON output
+        result = subprocess.run(
+            ['npm', 'run', 'get-accounts-json'],
+            cwd=backend_dir,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            return jsonify({
+                'error': 'Failed to fetch strike prices',
+                'details': result.stderr
+            }), 500
+        
+        # Parse JSON output and extract only strike prices
+        data = json.loads(result.stdout)
+        
+        if data.get('success'):
+            return jsonify({
+                'success': True,
+                'strikePrices': data.get('strikePrices', []),
+                'count': len(data.get('strikePrices', []))
+            }), 200
+        else:
+            return jsonify(data), 500
+        
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Request timeout'}), 504
+    except json.JSONDecodeError as e:
+        return jsonify({
+            'error': 'Failed to parse response',
+            'details': str(e)
+        }), 500
+    except Exception as e:
+        return jsonify({
+            'error': 'Error fetching strike prices',
+            'details': str(e)
+        }), 500
+
 def check_liquidation_condition(current_price: float, liquidation_price: float, option_type: str) -> bool:
     """Check if liquidation condition is met"""
     if liquidation_price <= 0:
