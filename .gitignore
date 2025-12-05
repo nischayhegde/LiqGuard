@@ -23,3 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 
+# Python virtual environments
+venv/
+.venv/
+__pycache__/
+*.py[cod]
