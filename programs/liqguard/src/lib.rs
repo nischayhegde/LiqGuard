@@ -1,11 +1,19 @@
 use anchor_lang::prelude::*;
 use pyth_solana_receiver_sdk::price_update::{get_feed_id_from_hex, PriceUpdateV2};
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("EAVJioMyQKbHEKNAr5kRg4e4gFahmgwd9bWVCBD4Svnc");
 
 #[program]
 pub mod liqguard {
     use super::*;
+
+    // initialize global config
+    pub fn initialize_config(ctx: Context<InitializeConfig>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.authority = ctx.accounts.authority.key();
+        config.bump = ctx.bumps.config;
+        Ok(())
+    }
 
     pub fn initialize_policy(
         ctx: Context<InitializePolicy>,
@@ -109,13 +117,47 @@ pub mod liqguard {
     }
 }
 
+#[account]
+pub struct Config {
+    pub authority: Pubkey,
+    pub bump: u8,
+}
+
+impl Config {
+    pub const LEN: usize = 32 + 1; // authority + bump
+}
+
 #[derive(Accounts)]
+pub struct InitializeConfig<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Config::LEN,
+        seeds = [b"config"],
+        bump
+    )]
+    pub config: Account<'info, Config>,
+    
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(strike_price: u64, is_long_insurance: bool, coverage_amount: u64)]
 pub struct InitializePolicy<'info> {
     #[account(
         init,
         payer = owner,
         space = 8 + Policy::LEN,
-        seeds = [b"policy", owner.key().as_ref()],
+        seeds = [
+            b"policy",
+            owner.key().as_ref(),
+            strike_price.to_le_bytes(),
+            &[is_long_insurance as u8],
+            &coverage_amount.to_le_bytes(),
+        ],
         bump
     )]
     pub policy: Account<'info, Policy>,
@@ -139,7 +181,13 @@ pub struct InitializePolicy<'info> {
 pub struct LiquidatePolicy<'info> {
     #[account(
         mut,
-        seeds = [b"policy", policy.owner.as_ref()],
+        seeds = [
+            b"policy",
+            policy.owner.as_ref(),
+            &policy.strike_price.to_le_bytes(),
+            &[policy.is_long_insurance as u8],
+            &policy.coverage_amount.to_le_bytes(),
+        ],
         bump = policy.policy_bump
     )]
     pub policy: Account<'info, Policy>,
@@ -158,8 +206,15 @@ pub struct LiquidatePolicy<'info> {
     #[account(mut)]
     pub user: AccountInfo<'info>,
 
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+        has_one = authority @ LiqGuardError::Unauthorized
+    )]
+    pub config: Account<'info, Config>,
+
     #[account(mut)]
-    pub signer: Signer<'info>,
+    pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -189,5 +244,7 @@ pub enum LiqGuardError {
     LiquidationConditionNotMet,
     #[msg("Policy has already been claimed")]
     AlreadyClaimed,
+    #[msg("Unauthorized: signer is not the authority")]
+    Unauthorized,
 }
 
