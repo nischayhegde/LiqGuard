@@ -1,69 +1,59 @@
-# Flask Backend API
+# LiqGuard Monitor
 
-Backend API for calculating insurance premiums using the Black-Scholes model.
+Node.js monitor script that listens to Pyth Network price feeds and triggers liquidations on Solana.
 
 ## Setup
 
 1. Install dependencies:
 ```bash
-pip install -r requirements.txt
+npm install
 ```
 
-2. Run the Flask server:
+2. Copy `.env.example` to `.env` and configure:
 ```bash
-python app.py
+cp .env.example .env
 ```
 
-The server will start on `http://localhost:5000`
-
-## API Endpoints
-
-### POST /calculate-risk
-
-Calculate insurance premium using Black-Scholes algorithm.
-
-**Request Body:**
-```json
-{
-  "optionPrice": 100.0,
-  "liquidationPrice": 90.0,
-  "insuranceAmount": 1000.0,
-  "optionType": "call",
-  "expirationDate": "2024-12-31",
-  "currentAssetPrice": 150.0,
-  "volatility": 0.3,
-  "riskFreeRate": 0.05
-}
+3. Set your Solana private key in `.env`:
+```
+PRIVATE_KEY=your_base58_private_key_here
 ```
 
-**Response:**
-```json
-{
-  "premium": 25.50,
-  "blackScholesPrice": 5.25,
-  "strikePrice": 90.0,
-  "timeToExpiration": 30.0,
-  "volatility": 0.3,
-  "riskFreeRate": 0.05
-}
+4. Configure demo mode (optional):
+```
+DEMO_MODE=CRASH  # or PUMP
 ```
 
-### GET /health
+## Usage
 
-Health check endpoint.
-
-**Response:**
-```json
-{
-  "status": "healthy"
-}
+Run the monitor:
+```bash
+npm run monitor
 ```
 
-## Black-Scholes Model
+Or in development mode with auto-reload:
+```bash
+npm run dev
+```
 
-The endpoint uses the Black-Scholes model to calculate option prices, which is then used as a component in the premium calculation along with risk factors based on:
-- Distance to liquidation price
-- Volatility
-- Time to expiration
-- Insurance coverage amount
+## Demo Modes
 
+- **CRASH**: Triggers when BTC price < $100,000 (simulates Long getting wrecked)
+- **PUMP**: Triggers when BTC price > $90,000 (simulates Short getting wrecked)
+
+## Architecture
+
+The monitor:
+1. Connects to Pyth Hermes WebSocket
+2. Listens for BTC/USD price updates
+3. Normalizes prices from Pyth format (i64 + exponent) to USD
+4. Checks liquidation conditions based on policy parameters
+5. Bundles `addPostPriceUpdates` + `liquidate_policy` into atomic transactions
+6. Executes liquidations when conditions are met
+
+## Notes
+
+- The monitor requires the Anchor program IDL to be generated first
+- Run `anchor build` in the project root to generate the IDL
+- The generated IDL should be placed in `target/idl/liqguard.json`
+- Update the monitor.ts to load and use the generated Anchor client
