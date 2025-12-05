@@ -3,6 +3,7 @@ import cors from 'cors';
 import { ethers } from 'ethers';
 import { HermesClient } from '@pythnetwork/hermes-client';
 import dotenv from 'dotenv';
+import { dbOperations, type Policy } from './database.js';
 
 dotenv.config();
 
@@ -28,17 +29,6 @@ const USDC_ABI = [
 // Global state
 let currentSolPrice: number | null = null;
 let currentEthPrice: number | null = null;
-const activePolicies: Array<{
-  id: string;
-  liquidationPrice: number;
-  optionType: string;
-  insuranceAmount: number;
-  expirationDate?: string;
-  userWalletAddress: string;
-  premiumPaid: boolean;
-  createdAt: string;
-  status: string;
-}> = [];
 
 // Initialize provider and wallet
 let provider: ethers.JsonRpcProvider | null = null;
@@ -202,22 +192,23 @@ async function startPriceMonitoring() {
             currentSolPrice = normalizedPrice;
             console.log(`💰 SOL/USD Price: $${normalizedPrice.toFixed(2)}`);
             
-            // Check liquidation conditions
-            for (const policy of activePolicies) {
-              if (policy.status !== 'active') continue;
-              
-              const liquidationPrice = policy.liquidationPrice;
+            // Check liquidation conditions from database
+            const policiesToCheck = dbOperations.getPoliciesToMonitor();
+            
+            for (const policy of policiesToCheck) {
+              const strikePrice = policy.strikePrice;
               const optionType = policy.optionType;
               
               let conditionMet = false;
               if (optionType === 'call') {
-                conditionMet = normalizedPrice > liquidationPrice;
+                conditionMet = normalizedPrice > strikePrice;
               } else if (optionType === 'put') {
-                conditionMet = normalizedPrice < liquidationPrice;
+                conditionMet = normalizedPrice < strikePrice;
               }
               
               if (conditionMet) {
                 console.log(`\n🔥 LIQUIDATION TRIGGERED! Policy: ${policy.id}`);
+                console.log(`   Strike: $${strikePrice}, Current: $${normalizedPrice.toFixed(2)}, Type: ${optionType}`);
                 await resolveLiquidation(policy, normalizedPrice);
               }
             }
@@ -261,7 +252,7 @@ async function startPriceMonitoring() {
   }, 5000);
 }
 
-async function resolveLiquidation(policy: typeof activePolicies[0], currentPrice: number) {
+async function resolveLiquidation(policy: Policy, currentPrice: number) {
   try {
     if (!senderWallet || !provider) {
       console.error('❌ Sender wallet not initialized');
@@ -271,8 +262,18 @@ async function resolveLiquidation(policy: typeof activePolicies[0], currentPrice
     const userAddress = policy.userWalletAddress;
     const insuranceAmount = policy.insuranceAmount;
     
+    // Check ETH balance for gas fees first
+    const ethBalance = await provider.getBalance(senderWallet.address);
+    const minEthForGas = ethers.parseEther('0.001'); // Minimum 0.001 ETH for gas
+    console.log(`   Backend ETH balance: ${ethers.formatEther(ethBalance)} ETH`);
+    
+    if (ethBalance < minEthForGas) {
+      console.error(`❌ Insufficient ETH for gas fees. Need at least 0.001 ETH, have ${ethers.formatEther(ethBalance)} ETH`);
+      console.error(`   Please fund the backend wallet (${senderWallet.address}) with ETH on Base network`);
+      return;
+    }
+    
     // Convert USD to USDC (USDC has 6 decimals)
-    // 1 USD = 1 USDC, so we just need to convert to USDC units
     const amountInUSDC = ethers.parseUnits(insuranceAmount.toFixed(6), 6);
     
     console.log(`💰 Sending USDC payout:`);
@@ -282,7 +283,7 @@ async function resolveLiquidation(policy: typeof activePolicies[0], currentPrice
     // Get USDC contract instance
     const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, senderWallet);
     
-    // Check balance
+    // Check USDC balance
     const balance = await usdcContract.balanceOf(senderWallet.address);
     console.log(`   Backend USDC balance: ${ethers.formatUnits(balance, 6)} USDC`);
     
@@ -300,17 +301,19 @@ async function resolveLiquidation(policy: typeof activePolicies[0], currentPrice
       console.log(`✅ USDC payout sent! Block: ${receipt.blockNumber}`);
     }
     
-    // Update policy status
-    const policyIndex = activePolicies.findIndex(p => p.id === policy.id);
-    if (policyIndex !== -1) {
-      const updatedPolicy = {
-        ...activePolicies[policyIndex],
-        status: 'resolved' as const,
-        resolvedAt: new Date().toISOString(),
-        payoutAmount: insuranceAmount,
-        payoutTxHash: tx.hash,
-      };
-      activePolicies[policyIndex] = updatedPolicy;
+    // Update policy status in database
+    dbOperations.markPolicyResolved(policy.id, tx.hash);
+    console.log(`✅ Policy ${policy.id} marked as resolved in database`);
+    
+    // If Solana policy account address is set, call Solana smart contract to close policy
+    // This would require Solana web3.js and Anchor client setup
+    if (policy.policyAccountAddress) {
+      console.log(`📞 Solana policy account: ${policy.policyAccountAddress}`);
+      console.log(`   To integrate: Use @solana/web3.js and Anchor client to call close_policy with payout=true`);
+      // Example integration:
+      // const connection = new Connection(SOLANA_RPC_URL);
+      // const program = new Program(idl, PROGRAM_ID, provider);
+      // await program.methods.closePolicy(true).accounts({...}).rpc();
     }
   } catch (error) {
     console.error('❌ Error sending payout:', error);
@@ -319,11 +322,16 @@ async function resolveLiquidation(policy: typeof activePolicies[0], currentPrice
 
 // Routes
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    currentSolPrice,
-    activePolicies: activePolicies.length
-  });
+  try {
+    const activePolicies = dbOperations.getActivePolicies();
+    res.json({
+      status: 'healthy',
+      currentSolPrice,
+      activePolicies: activePolicies.length
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/current-price', (req, res) => {
@@ -403,6 +411,10 @@ app.post('/pay-premium', (req, res) => {
     }
     
     console.log(`✅ Premium payment received from ${userWalletAddress}: $${premiumAmount}`);
+    console.log(`   Transaction: ${transactionSignature}`);
+    
+    // Update premium amount in database if policy exists
+    // This will be handled when policy is registered
     
     res.json({
       status: 'paid',
@@ -438,28 +450,30 @@ app.post('/register-policy', (req, res) => {
       return res.status(400).json({ error: 'Premium must be paid before registering policy' });
     }
     
-    const policyId = `policy_${Date.now()}`;
-    const policy = {
-      id: policyId,
-      liquidationPrice,
-      optionType,
+    // Get premium amount from request or calculate it
+    // For now, we'll use a default or get it from the request
+    const premiumAmount = req.body.premiumAmount || 0;
+    
+    // Save to database
+    const policy = dbOperations.createPolicy({
+      userWalletAddress: userWalletAddress.toLowerCase(),
+      strikePrice: liquidationPrice,
+      optionType: optionType as 'call' | 'put',
       insuranceAmount,
-      expirationDate,
-      userWalletAddress,
-      premiumPaid,
-      createdAt: new Date().toISOString(),
-      status: 'active'
-    };
+      premiumAmount: premiumAmount,
+      expirationDate: expirationDate || null,
+      status: 'active',
+      premiumPaid: true,
+    });
     
-    activePolicies.push(policy);
-    
-    console.log(`✅ Registered policy ${policyId} for monitoring`);
+    console.log(`✅ Registered policy ${policy.id} for monitoring`);
     console.log(`   User: ${userWalletAddress}`);
     console.log(`   Liquidation: $${liquidationPrice}, Type: ${optionType}`);
+    console.log(`   Saved to database`);
     
     res.json({
       status: 'registered',
-      policyId,
+      policyId: policy.id,
       message: 'Policy registered for monitoring'
     });
   } catch (error: any) {
@@ -468,10 +482,60 @@ app.post('/register-policy', (req, res) => {
 });
 
 app.get('/active-policies', (req, res) => {
-  res.json({
-    policies: activePolicies,
-    count: activePolicies.length
-  });
+  try {
+    const policies = dbOperations.getActivePolicies();
+    res.json({
+      policies: policies.map(p => ({
+        id: p.id,
+        liquidationPrice: p.strikePrice,
+        optionType: p.optionType,
+        insuranceAmount: p.insuranceAmount,
+        expirationDate: p.expirationDate,
+        userWalletAddress: p.userWalletAddress,
+        premiumPaid: p.premiumPaid,
+        createdAt: p.createdAt,
+        status: p.status
+      })),
+      count: policies.length
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/user-policies', (req, res) => {
+  try {
+    const userAddress = req.query.address as string;
+    
+    if (!userAddress) {
+      return res.status(400).json({ error: 'User wallet address is required' });
+    }
+    
+    // Fetch from database
+    const userPolicies = dbOperations.getUserPolicies(userAddress, 'active');
+    
+    console.log(`🔍 Fetched ${userPolicies.length} active policies for user: ${userAddress}`);
+    
+    res.json({
+      policies: userPolicies.map(p => ({
+        id: p.id,
+        liquidationPrice: p.strikePrice,
+        optionType: p.optionType,
+        insuranceAmount: p.insuranceAmount,
+        expirationDate: p.expirationDate,
+        userWalletAddress: p.userWalletAddress,
+        premiumPaid: p.premiumPaid,
+        createdAt: p.createdAt,
+        status: p.status,
+        resolvedAt: p.resolvedAt,
+        payoutTxHash: p.payoutTxHash
+      })),
+      count: userPolicies.length,
+      userAddress: userAddress
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: `Error fetching user policies: ${error.message}` });
+  }
 });
 
 app.post('/resolve', (req, res) => {

@@ -514,6 +514,34 @@ def get_active_policies():
             'count': len(active_policies)
         }), 200
 
+@app.route('/user-policies', methods=['GET'])
+def get_user_policies():
+    """Get all active policies for a specific user wallet address"""
+    try:
+        user_address = request.args.get('address')
+        
+        if not user_address:
+            return jsonify({'error': 'User wallet address is required'}), 400
+        
+        # Normalize address (lowercase for comparison)
+        user_address_lower = user_address.lower()
+        
+        with price_lock:
+            user_policies = [
+                policy for policy in active_policies
+                if policy.get('userWalletAddress', '').lower() == user_address_lower
+                and policy.get('status') == 'active'
+            ]
+        
+        return jsonify({
+            'policies': user_policies,
+            'count': len(user_policies),
+            'userAddress': user_address
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Error fetching user policies: {str(e)}'}), 500
+
 def check_liquidation_condition(current_price: float, liquidation_price: float, option_type: str) -> bool:
     """Check if liquidation condition is met"""
     if liquidation_price <= 0:
@@ -531,7 +559,9 @@ def check_liquidation_condition(current_price: float, liquidation_price: float, 
 def call_resolve_endpoint(current_price: float, liquidation_price: float, option_type: str, policy_id: str):
     """Call /resolve endpoint when liquidation condition is met"""
     try:
-        url = f'http://localhost:5000/resolve'
+        # Get port from environment variable, default to 8000
+        port = os.getenv('PORT', '8000')
+        url = f'http://localhost:{port}/resolve'
         payload = {
             'currentPrice': current_price,
             'liquidationPrice': liquidation_price,
@@ -649,5 +679,7 @@ def start_price_monitor():
 if __name__ == '__main__':
     # Start price monitoring in background thread
     start_price_monitor()
-    app.run(debug=True, port=5000)
+    # Get port from environment variable, default to 8000
+    port = int(os.getenv('PORT', 8000))
+    app.run(debug=True, port=port)
 

@@ -1,6 +1,10 @@
 import { useState, useEffect } from 'react'
 import { ethers } from 'ethers'
 
+// Get backend URL from environment variable, default to port 8000
+const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000'
+const API_BASE_URL = `http://localhost:${BACKEND_PORT}`
+
 function App() {
   const [formData, setFormData] = useState({
     liquidationPrice: '',
@@ -16,7 +20,10 @@ function App() {
   const [error, setError] = useState(null)
   const [showChart, setShowChart] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+  const [showPositions, setShowPositions] = useState(false)
   const [policyRegistered, setPolicyRegistered] = useState(false)
+  const [userPositions, setUserPositions] = useState([])
+  const [loadingPositions, setLoadingPositions] = useState(false)
   const [currentSolPrice, setCurrentSolPrice] = useState(null)
   const [priceLoading, setPriceLoading] = useState(true)
   const [provider, setProvider] = useState(null)
@@ -49,17 +56,17 @@ function App() {
         params: [{ chainId: BASE_MAINNET_CHAIN_ID }],
       })
     } catch (switchError) {
-      // This error code indicates that the chain has not been added to MetaMask
+      // This error code indicates that the chain has not been added to the wallet
       if (switchError.code === 4902) {
         try {
-          // Add Base network to MetaMask
+          // Add Base network to wallet
           await window.ethereum.request({
             method: 'wallet_addEthereumChain',
             params: [BASE_MAINNET_CONFIG],
           })
         } catch (addError) {
           console.error('Error adding Base network:', addError)
-          throw new Error('Failed to add Base network to MetaMask. Please add it manually.')
+          throw new Error('Failed to add Base network to your wallet. Please add it manually.')
         }
       } else {
         throw switchError
@@ -67,39 +74,99 @@ function App() {
     }
   }
 
-  // Connect MetaMask wallet and ensure we're on Base network
+  // Connect wallet (MetaMask, Phantom, or any EIP-1193 compatible wallet) and ensure we're on Base network
   const connectWallet = async () => {
-    if (typeof window.ethereum !== 'undefined') {
+    // Check for any EIP-1193 compatible wallet (MetaMask, Phantom, etc.)
+    if (typeof window.ethereum === 'undefined') {
+      setError('No Ethereum wallet found. Please install MetaMask, Phantom, or another compatible wallet.')
+      return
+    }
+
+    // Check if Phantom is in Solana mode (has window.solana but not Ethereum support)
+    if (window.solana && !window.ethereum.isMetaMask) {
+      // Phantom might need to be switched to Ethereum mode
+      console.log('Phantom wallet detected. Make sure it\'s in Ethereum mode.')
+    }
+
+    try {
+      // First, request accounts directly from window.ethereum (works better with Phantom)
+      let accounts
       try {
-        // First, switch to Base network
-        await switchToBaseNetwork()
-        
+        accounts = await window.ethereum.request({ method: 'eth_requestAccounts' })
+      } catch (requestError) {
+        // If direct request fails, try through ethers
+        console.log('Direct request failed, trying through ethers...', requestError)
         const provider = new ethers.BrowserProvider(window.ethereum)
-        const accounts = await provider.send('eth_requestAccounts', [])
-        const signer = await provider.getSigner()
-        
-        // Verify we're on Base network
-        const network = await provider.getNetwork()
-        const BASE_MAINNET_CHAIN_ID = 8453n
-        if (network.chainId !== BASE_MAINNET_CHAIN_ID) {
-          throw new Error('Please switch to Base mainnet in MetaMask')
-        }
-        
-        setProvider(provider)
-        setSigner(signer)
-        setAccount(accounts[0])
-        setConnected(true)
-        setError(null) // Clear any previous errors
-      } catch (err) {
-        console.error('Error connecting wallet:', err)
-        if (err.message?.includes('switch') || err.message?.includes('network')) {
-          setError('Please approve the network switch in MetaMask and try again.')
-        } else {
-          setError('Failed to connect wallet. Please make sure MetaMask is installed and switch to Base mainnet.')
+        accounts = await provider.send('eth_requestAccounts', [])
+      }
+      
+      // If user cancels or no accounts, accounts will be empty
+      if (!accounts || accounts.length === 0) {
+        setError('Wallet connection cancelled or no accounts found. Please try again and approve the connection.')
+        return
+      }
+      
+      // Now switch to Base network after we have accounts
+      try {
+        await switchToBaseNetwork()
+      } catch (networkError) {
+        console.warn('Network switch error (continuing anyway):', networkError)
+        // Continue even if network switch fails - user might already be on Base
+      }
+      
+      // Create provider and signer
+      const provider = new ethers.BrowserProvider(window.ethereum)
+      const signer = await provider.getSigner()
+      
+      // Verify we're on Base network
+      const network = await provider.getNetwork()
+      const BASE_MAINNET_CHAIN_ID = 8453n
+      if (network.chainId !== BASE_MAINNET_CHAIN_ID) {
+        // Try one more time to switch
+        try {
+          await switchToBaseNetwork()
+          // Wait a moment for network switch
+          await new Promise(resolve => setTimeout(resolve, 1000))
+          // Re-check network
+          const newNetwork = await provider.getNetwork()
+          if (newNetwork.chainId !== BASE_MAINNET_CHAIN_ID) {
+            throw new Error('Please switch to Base mainnet in your wallet')
+          }
+        } catch (switchErr) {
+          throw new Error('Please switch to Base mainnet (Chain ID: 8453) in your wallet settings')
         }
       }
-    } else {
-      setError('MetaMask is not installed. Please install MetaMask to continue.')
+      
+      setProvider(provider)
+      setSigner(signer)
+      setAccount(accounts[0])
+      setConnected(true)
+      setError(null) // Clear any previous errors
+      console.log('✅ Connected to Base mainnet with account:', accounts[0])
+    } catch (err) {
+      console.error('Error connecting wallet:', err)
+      
+      // Handle specific error codes
+      if (err.code === 4001 || err.code === -32002) {
+        setError('Connection request rejected. Please approve the connection in your wallet and try again.')
+      } else if (err.code === 4100) {
+        setError('Unauthorized. Please unlock your wallet and try again.')
+      } else if (err.message?.includes('authorized') || err.message?.includes('not been authorized')) {
+        setError(
+          'Wallet authorization required.\n\n' +
+          'For Phantom wallet:\n' +
+          '1. Make sure Phantom is unlocked\n' +
+          '2. Click "Connect" when Phantom prompts you\n' +
+          '3. Make sure you\'re in Ethereum mode (not Solana mode)\n' +
+          '4. Try connecting again'
+        )
+      } else if (err.message?.includes('switch') || err.message?.includes('network')) {
+        setError('Please approve the network switch in your wallet and try again.')
+      } else if (err.message?.includes('cancelled') || err.message?.includes('rejected')) {
+        setError('Wallet connection was cancelled. Please try again.')
+      } else {
+        setError(err.message || 'Failed to connect wallet. Please make sure your wallet is unlocked and try again.')
+      }
     }
   }
 
@@ -140,12 +207,12 @@ function App() {
             throw new Error('Network switch failed')
           }
         } catch (switchErr) {
-          throw new Error(
-            `❌ Wrong network!\n\n` +
-            `You are connected to chain ID: ${network.chainId}\n` +
-            `Please switch to Base mainnet (chain ID: 8453)\n\n` +
-            `Click "Connect Wallet" again to automatically switch networks, or manually switch in MetaMask.`
-          )
+             throw new Error(
+               `❌ Wrong network!\n\n` +
+               `You are connected to chain ID: ${network.chainId}\n` +
+               `Please switch to Base mainnet (chain ID: 8453)\n\n` +
+               `Click "Connect Wallet" again to automatically switch networks, or manually switch in your wallet.`
+             )
         }
       }
       
@@ -260,7 +327,8 @@ function App() {
       console.log('Transaction confirmed:', receipt)
 
       // Notify backend of payment
-      const response = await fetch('http://localhost:5000/pay-premium', {
+      console.log('📤 Notifying backend of premium payment...')
+      const response = await fetch(`${API_BASE_URL}/pay-premium`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -273,10 +341,16 @@ function App() {
       })
 
       if (response.ok) {
+        const paymentData = await response.json()
+        console.log('✅ Payment confirmed by backend:', paymentData)
         setPremiumPaid(true)
-        await registerPolicy()
+        // Register policy immediately after payment confirmation
+        // Don't rely on premiumPaid state since it's async
+        console.log('📝 Starting policy registration...')
+        await registerPolicy(true)
       } else {
         const errorData = await response.json()
+        console.error('❌ Payment confirmation failed:', errorData)
         throw new Error(errorData.error || 'Failed to confirm payment')
       }
     } catch (err) {
@@ -288,35 +362,56 @@ function App() {
   }
 
   // Register policy after premium is paid
-  const registerPolicy = async () => {
-    if (!account || !premiumPaid) return
+  const registerPolicy = async (forceRegister = false) => {
+    // Allow forced registration (when called after payment) or check state
+    if (!account || (!premiumPaid && !forceRegister)) {
+      console.log('Skipping policy registration:', { account: !!account, premiumPaid, forceRegister })
+      return
+    }
 
     try {
       const liquidationPrice = parseFloat(formData.liquidationPrice) || 0
-      if (liquidationPrice <= 0) return
+      if (liquidationPrice <= 0) {
+        console.log('Skipping policy registration: no liquidation price')
+        return
+      }
 
-      const response = await fetch('http://localhost:5000/register-policy', {
+      const policyData = {
+        liquidationPrice: liquidationPrice,
+        optionType: formData.optionType,
+        insuranceAmount: parseFloat(formData.insuranceAmount) || 0,
+        expirationDate: formData.expirationDate || null,
+        userWalletAddress: account,
+        premiumPaid: true,
+        premiumAmount: parseFloat(calculatedPremium) || 0,
+      }
+
+      console.log('📝 Registering policy:', policyData)
+
+      const response = await fetch(`${API_BASE_URL}/register-policy`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          liquidationPrice: liquidationPrice,
-          optionType: formData.optionType,
-          insuranceAmount: parseFloat(formData.insuranceAmount) || 0,
-          expirationDate: formData.expirationDate || null,
-          userWalletAddress: account,
-          premiumPaid: true,
-        }),
+        body: JSON.stringify(policyData),
       })
 
       if (response.ok) {
         const result = await response.json()
         setPolicyRegistered(true)
-        console.log('✅ Policy registered:', result.policyId)
+        console.log('✅ Policy registered successfully:', result.policyId)
+        // Refresh positions after registration
+        if (showPositions) {
+          setTimeout(() => fetchUserPositions(), 1000)
+        }
+      } else {
+        const errorData = await response.json()
+        console.error('❌ Failed to register policy:', errorData)
+        throw new Error(errorData.error || 'Failed to register policy')
       }
     } catch (err) {
-      console.error('Failed to register policy:', err)
+      console.error('❌ Error registering policy:', err)
+      setError(err.message || 'Failed to register policy. Please try again.')
     }
   }
 
@@ -324,7 +419,7 @@ function App() {
   useEffect(() => {
     const fetchSolPrice = async () => {
       try {
-        const response = await fetch('http://localhost:5000/current-price')
+        const response = await fetch(`${API_BASE_URL}/current-price`)
         if (response.ok) {
           const data = await response.json()
           const price = data.price
@@ -371,7 +466,7 @@ function App() {
   useEffect(() => {
     const fetchBackendWallet = async () => {
       try {
-        const response = await fetch('http://localhost:5000/backend-wallet-address')
+        const response = await fetch(`${API_BASE_URL}/backend-wallet-address`)
         if (response.ok) {
           const data = await response.json()
           setBackendWalletAddress(data.address)
@@ -383,12 +478,78 @@ function App() {
         }
       } catch (err) {
         console.error('Error fetching backend wallet address:', err)
-        setError('Cannot connect to backend server. Make sure it\'s running on http://localhost:5000')
+        setError(`Cannot connect to backend server. Make sure it's running on ${API_BASE_URL}`)
       }
     }
     
     fetchBackendWallet()
   }, [])
+
+  // Fetch user positions when account changes or when positions tab is opened
+  const fetchUserPositions = async () => {
+    if (!account) {
+      setUserPositions([])
+      return
+    }
+
+    setLoadingPositions(true)
+    try {
+      const response = await fetch(`${API_BASE_URL}/user-policies?address=${encodeURIComponent(account)}`)
+      
+      // Check if response is OK
+      if (!response.ok) {
+        // Try to parse as JSON, but handle HTML responses
+        const contentType = response.headers.get('content-type')
+        if (contentType && contentType.includes('application/json')) {
+          const errorData = await response.json()
+          console.error('Failed to fetch user positions:', errorData.error || errorData)
+        } else {
+          // Response is HTML (likely an error page)
+          const text = await response.text()
+          console.error('Server returned HTML instead of JSON:', response.status, response.statusText)
+          console.error('Response preview:', text.substring(0, 200))
+        }
+        setUserPositions([])
+        return
+      }
+
+      // Parse JSON response
+      const contentType = response.headers.get('content-type')
+      if (!contentType || !contentType.includes('application/json')) {
+        console.error('Response is not JSON:', contentType)
+        setUserPositions([])
+        return
+      }
+
+      const data = await response.json()
+      setUserPositions(data.policies || [])
+      console.log('✅ Fetched user positions:', data.policies)
+      if (data.debug) {
+        console.log('📊 Debug info:', {
+          totalPolicies: data.debug.totalPolicies,
+          activePolicies: data.debug.activePolicies,
+          searchedAddress: data.debug.searchedAddress,
+          found: data.count
+        })
+      }
+    } catch (err) {
+      console.error('Error fetching user positions:', err)
+      // If it's a JSON parse error, log more details
+      if (err instanceof SyntaxError && err.message.includes('JSON')) {
+        console.error('Failed to parse response as JSON. The server may have returned an error page.')
+      }
+      setUserPositions([])
+    } finally {
+      setLoadingPositions(false)
+    }
+  }
+
+  // Fetch positions when account changes or when positions tab is shown
+  useEffect(() => {
+    if (showPositions && account) {
+      fetchUserPositions()
+    }
+  }, [showPositions, account])
 
 
   // Auto-calculate premium when form data changes
@@ -461,7 +622,7 @@ function App() {
     setPolicyRegistered(false) // Reset when recalculating
 
     try {
-      const response = await fetch('http://localhost:5000/calculate-risk', {
+      const response = await fetch(`${API_BASE_URL}/calculate-risk`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -514,7 +675,7 @@ function App() {
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-lg font-semibold mb-1">Connect Your Wallet</h2>
-              <p className="text-sm text-gray-400">Connect your MetaMask wallet to purchase insurance</p>
+              <p className="text-sm text-gray-400">Connect your wallet (MetaMask, Phantom, etc.) to purchase insurance</p>
             </div>
             {!connected ? (
               <button
@@ -576,31 +737,22 @@ function App() {
                   type="number"
                   name="currentAssetPrice"
                   value={formData.currentAssetPrice}
-                  onChange={handleInputChange}
+                  readOnly
                   placeholder={priceLoading ? "Loading..." : "0.00"}
                   step="0.01"
                   min="0"
                   required
                   disabled={priceLoading}
-                  className="w-full bg-[#1a1f35] border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full bg-[#1a1f35] border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-not-allowed"
                 />
                 {currentSolPrice && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setFormData(prev => ({
-                        ...prev,
-                        currentAssetPrice: currentSolPrice.toFixed(2)
-                      }))
-                    }}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded hover:bg-green-500/30 transition-colors"
-                  >
-                    Use Live Price
-                  </button>
+                  <div className="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded">
+                    Live
+                  </div>
                 )}
               </div>
               <p className="mt-1 text-xs text-gray-500">
-                {priceLoading ? 'Fetching current SOL price...' : 'Automatically updated from Pyth Network'}
+                {priceLoading ? 'Fetching current SOL price...' : 'Automatically updated from Pyth Network (read-only)'}
               </p>
             </div>
 
@@ -835,6 +987,24 @@ function App() {
         {/* Action Buttons */}
         <div className="flex gap-4 mb-6">
           <button
+            onClick={() => {
+              setShowPositions(!showPositions)
+              if (!showPositions && account) {
+                fetchUserPositions()
+              }
+            }}
+            className={`flex items-center gap-2 px-4 py-2 border rounded-lg transition-colors ${
+              showPositions
+                ? 'bg-blue-600 border-blue-500 text-white'
+                : 'bg-[#131829] border-gray-800 text-gray-300 hover:text-white hover:border-gray-700'
+            }`}
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+            </svg>
+            My Positions {userPositions.length > 0 && `(${userPositions.length})`}
+          </button>
+          <button
             onClick={() => setShowChart(!showChart)}
             className="flex items-center gap-2 px-4 py-2 bg-[#131829] border border-gray-800 rounded-lg text-gray-300 hover:text-white hover:border-gray-700 transition-colors"
           >
@@ -855,6 +1025,141 @@ function App() {
             Show History
           </button>
         </div>
+
+        {/* User Positions Panel */}
+        {showPositions && (
+          <div className="bg-[#131829] rounded-xl p-6 mb-6 border border-gray-800">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold">My Open Positions</h2>
+              <button
+                onClick={fetchUserPositions}
+                disabled={loadingPositions}
+                className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                <svg className={`w-4 h-4 ${loadingPositions ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Refresh
+              </button>
+            </div>
+
+            {!connected ? (
+              <div className="text-center py-8">
+                <p className="text-gray-400 mb-4">Please connect your wallet to view your positions</p>
+                <button
+                  onClick={connectWallet}
+                  className="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold transition-colors"
+                >
+                  Connect Wallet
+                </button>
+              </div>
+            ) : loadingPositions ? (
+              <div className="text-center py-8">
+                <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+                <p className="text-gray-400 mt-4">Loading positions...</p>
+              </div>
+            ) : userPositions.length === 0 ? (
+              <div className="text-center py-8">
+                <svg className="w-16 h-16 mx-auto text-gray-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <p className="text-gray-400 text-lg mb-2">No open positions found</p>
+                <p className="text-gray-500 text-sm">Create a new insurance policy to get started</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {userPositions.map((position, index) => {
+                  const isCall = position.optionType === 'call'
+                  const strikePrice = position.liquidationPrice || position.strikePrice || 0
+                  const isInTheMoney = currentSolPrice && (
+                    isCall 
+                      ? currentSolPrice > strikePrice 
+                      : currentSolPrice < strikePrice
+                  )
+                  
+                  return (
+                    <div
+                      key={position.id || index}
+                      className="bg-[#1a1f35] border border-gray-700 rounded-lg p-4 hover:border-gray-600 transition-colors"
+                    >
+                      <div className="flex items-start justify-between mb-3">
+                        <div className="flex items-center gap-3">
+                          <div className={`w-3 h-3 rounded-full ${isCall ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-white">
+                                {isCall ? 'Call' : 'Put'} Option
+                              </span>
+                              <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                                isInTheMoney 
+                                  ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+                                  : 'bg-gray-700 text-gray-300'
+                              }`}>
+                                {isInTheMoney ? 'In The Money' : 'Out of The Money'}
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-500 mt-1">Policy ID: {position.id}</p>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-sm text-gray-400">Status</p>
+                          <p className="text-green-400 font-semibold">Active</p>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 pt-4 border-t border-gray-700">
+                        <div>
+                          <p className="text-xs text-gray-500 mb-1">Strike Price</p>
+                          <p className="text-white font-semibold">${parseFloat(position.liquidationPrice || position.strikePrice || 0).toFixed(2)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500 mb-1">Coverage Amount</p>
+                          <p className="text-white font-semibold">${formatUSD(position.insuranceAmount || 0)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500 mb-1">Current Price</p>
+                          <p className="text-white font-semibold">
+                            {currentSolPrice ? `$${currentSolPrice.toFixed(2)}` : 'Loading...'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500 mb-1">Expiration</p>
+                          <p className="text-white font-semibold">
+                            {position.expirationDate 
+                              ? new Date(position.expirationDate).toLocaleDateString()
+                              : 'N/A'
+                            }
+                          </p>
+                        </div>
+                      </div>
+
+                      {currentSolPrice && (
+                        <div className="mt-4 pt-4 border-t border-gray-700">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-gray-400">
+                              {isCall 
+                                ? `Price needs to rise above $${parseFloat(position.liquidationPrice || position.strikePrice || 0).toFixed(2)} to trigger`
+                                : `Price needs to fall below $${parseFloat(position.liquidationPrice || position.strikePrice || 0).toFixed(2)} to trigger`
+                              }
+                            </span>
+                            <span className={`text-sm font-medium ${
+                              isInTheMoney ? 'text-green-400' : 'text-gray-400'
+                            }`}>
+                              {isInTheMoney 
+                                ? '✓ Trigger Condition Met'
+                                : `$${Math.abs(currentSolPrice - parseFloat(position.liquidationPrice || position.strikePrice || 0)).toFixed(2)} away`
+                              }
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Market Data Cards */}
         <div className="grid md:grid-cols-2 gap-4">
