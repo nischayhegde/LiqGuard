@@ -2,7 +2,6 @@ import { useState } from 'react'
 
 function App() {
   const [formData, setFormData] = useState({
-    optionPrice: '',
     liquidationPrice: '',
     expirationDate: '',
     optionType: 'call',
@@ -27,12 +26,11 @@ function App() {
   }
 
   const calculatePremium = async (data = formData) => {
-    const price = parseFloat(data.optionPrice) || 0
     const insurance = parseFloat(data.insuranceAmount) || 0
     const assetPrice = parseFloat(data.currentAssetPrice) || 0
     
     // Don't calculate if required fields are missing
-    if (price <= 0 || insurance <= 0 || assetPrice <= 0) {
+    if (insurance <= 0 || assetPrice <= 0) {
       setCalculatedPremium(null)
       setPremiumData(null)
       return
@@ -48,7 +46,6 @@ function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          optionPrice: price,
           liquidationPrice: parseFloat(data.liquidationPrice) || 0,
           insuranceAmount: insurance,
           optionType: data.optionType,
@@ -103,35 +100,6 @@ function App() {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Option Price Input */}
-            <div>
-              <label className="block text-sm text-gray-400 mb-2">Option Price (USD) *</label>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 bg-[#1a1f35] border border-gray-700 rounded-lg px-4 py-3 min-w-[140px]">
-                  <div className="w-6 h-6 rounded-full bg-blue-500 flex items-center justify-center text-xs font-bold">
-                    $
-                  </div>
-                  <span className="font-medium">USD</span>
-                </div>
-                <div className="flex-1">
-                  <input
-                    type="number"
-                    name="optionPrice"
-                    value={formData.optionPrice}
-                    onChange={handleInputChange}
-                    placeholder="0.00"
-                    step="0.0001"
-                    min="0"
-                    required
-                    className="w-full bg-transparent text-right text-2xl font-semibold outline-none placeholder-gray-600 text-white"
-                  />
-                  <div className="text-right text-sm text-gray-500 mt-1">
-                    ${formatUSD(formData.optionPrice)}
-                  </div>
-                </div>
-              </div>
-            </div>
-
             {/* Current Asset Price */}
             <div>
               <label className="block text-sm text-gray-400 mb-2">Current Asset Price (USD) *</label>
@@ -232,8 +200,8 @@ function App() {
                 <div className="pt-3 border-t border-gray-700">
                   <div className="grid grid-cols-2 gap-4 text-sm">
                     <div>
-                      <p className="text-gray-500">Black-Scholes Price</p>
-                      <p className="text-white font-semibold">${premiumData.blackScholesPrice}</p>
+                      <p className="text-gray-500">Option Price (Calculated)</p>
+                      <p className="text-white font-semibold">${premiumData.optionPrice || premiumData.blackScholesPrice}</p>
                     </div>
                     <div>
                       <p className="text-gray-500">Strike Price</p>
@@ -304,7 +272,7 @@ function App() {
             </div>
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-lg font-semibold">${formData.optionPrice || '0.9997'}</div>
+                <div className="text-lg font-semibold">${formData.currentAssetPrice || '0.9997'}</div>
                 <div className="text-xs text-red-400">-0.01%</div>
               </div>
               <div className="w-20 h-10 flex items-end">

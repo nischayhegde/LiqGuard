@@ -1,6 +1,28 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import mibian
+
+# Check if scipy is available (required by mibian)
+try:
+    import scipy.stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("ERROR: scipy is not installed. mibian requires scipy to work properly.")
+    print("Please install scipy: pip install scipy")
+
+try:
+    import mibian
+    # Test if mibian actually works (it needs scipy at runtime)
+    try:
+        test_calc = mibian.BS([100, 90, 5, 30], volatility=30)
+        MIBIAN_AVAILABLE = True
+        print("mibian is available and working")
+    except Exception as e:
+        MIBIAN_AVAILABLE = False
+        print(f"ERROR: mibian imported but cannot calculate (likely missing scipy): {e}")
+except ImportError:
+    MIBIAN_AVAILABLE = False
+    print("ERROR: mibian is not installed. Please install: pip install mibian")
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend communication
@@ -20,7 +42,16 @@ def black_scholes(S, K, days_to_expiration, r, sigma, option_type='call'):
     Returns:
     Option price
     """
+    if not SCIPY_AVAILABLE or not MIBIAN_AVAILABLE:
+        print("ERROR: scipy or mibian not available. Cannot calculate option price.")
+        return 0
+    
     if days_to_expiration <= 0:
+        return 0
+    
+    # Validate inputs
+    if S <= 0 or K <= 0:
+        print(f"ERROR: Invalid prices - S={S}, K={K}")
         return 0
     
     try:
@@ -36,16 +67,19 @@ def black_scholes(S, K, days_to_expiration, r, sigma, option_type='call'):
         
         return max(price, 0)  # Ensure non-negative price
     except Exception as e:
-        # Fallback to 0 if calculation fails
+        # Fallback to 0 if calculation fails - log the full error
+        import traceback
         print(f"Error in Black-Scholes calculation: {e}")
+        print(f"Parameters: S={S}, K={K}, days={days_to_expiration}, r={r}, sigma={sigma}, type={option_type}")
+        traceback.print_exc()
         return 0
 
 def calculate_premium(option_price, insurance_amount, liquidation_price, current_price, volatility=0.3, risk_free_rate=0.05, days_to_expiration=30):
     """
-    Calculate insurance premium based on Black-Scholes and risk factors
+    Calculate insurance premium based on option price and coverage amount
     
     Parameters:
-    option_price: Current price of the option
+    option_price: Current price of the option (calculated via Black-Scholes)
     insurance_amount: Amount of insurance coverage requested
     liquidation_price: Price at which liquidation occurs
     current_price: Current market price of the underlying asset
@@ -56,45 +90,22 @@ def calculate_premium(option_price, insurance_amount, liquidation_price, current
     Returns:
     Premium amount
     """
-    if option_price <= 0 or insurance_amount <= 0:
+    if option_price <= 0 or insurance_amount <= 0 or current_price <= 0:
         return 0
     
-    # Use liquidation price as strike price for risk calculation
-    strike_price = liquidation_price if liquidation_price > 0 else current_price * 0.9
+    # The premium is the option price scaled by the coverage ratio
+    # Premium = option_price * (insurance_amount / current_price)
+    # This represents the cost to insure the insurance_amount worth of assets
     
-    # Calculate Black-Scholes price using mibian
-    bs_price = black_scholes(
-        S=current_price,
-        K=strike_price,
-        days_to_expiration=days_to_expiration,
-        r=risk_free_rate,
-        sigma=volatility,
-        option_type='put'  # Insurance is like a put option
-    )
+    coverage_ratio = insurance_amount / current_price
+    premium = option_price * coverage_ratio
     
-    # Base premium: percentage of insurance amount
-    base_premium_rate = 0.02  # 2% base rate
+    # Add a small risk premium based on volatility and time to expiration
+    # Higher volatility and longer time = higher risk premium
+    risk_premium_factor = 1 + (volatility * 0.1) + (days_to_expiration / 365.0 * 0.05)
+    premium = premium * risk_premium_factor
     
-    # Risk factor based on distance to liquidation
-    if liquidation_price > 0 and current_price > 0:
-        distance_to_liquidation = abs(current_price - liquidation_price) / current_price
-        # Higher risk if closer to liquidation
-        risk_multiplier = max(1.0, 1.5 - (distance_to_liquidation * 2))
-    else:
-        risk_multiplier = 1.2
-    
-    # Volatility risk factor
-    volatility_factor = 1 + (volatility - 0.2) * 0.5  # Adjust for volatility
-    
-    # Calculate premium
-    premium = insurance_amount * base_premium_rate * risk_multiplier * volatility_factor
-    
-    # Add Black-Scholes component (weighted)
-    bs_component = bs_price * (insurance_amount / current_price) * 0.1 if current_price > 0 else 0
-    
-    total_premium = premium + bs_component
-    
-    return round(total_premium, 4)
+    return round(premium, 4)
 
 @app.route('/calculate-risk', methods=['POST'])
 def calculate_risk():
@@ -103,19 +114,19 @@ def calculate_risk():
     
     Expected JSON payload:
     {
-        "optionPrice": float,
         "liquidationPrice": float,
         "insuranceAmount": float,
         "optionType": "call" or "put",
         "expirationDate": "YYYY-MM-DD" (optional),
-        "currentAssetPrice": float (required for Black-Scholes)
+        "currentAssetPrice": float (required for Black-Scholes),
+        "volatility": float (optional, default 0.3),
+        "riskFreeRate": float (optional, default 0.05)
     }
     """
     try:
         data = request.get_json()
         
         # Extract required fields
-        option_price = float(data.get('optionPrice', 0))
         liquidation_price = float(data.get('liquidationPrice', 0))
         insurance_amount = float(data.get('insuranceAmount', 0))
         current_asset_price = float(data.get('currentAssetPrice', 0))
@@ -123,9 +134,6 @@ def calculate_risk():
         expiration_date = data.get('expirationDate', None)
         
         # Validate required fields
-        if option_price <= 0:
-            return jsonify({'error': 'Option price must be greater than 0'}), 400
-        
         if insurance_amount <= 0:
             return jsonify({'error': 'Insurance amount must be greater than 0'}), 400
         
@@ -151,15 +159,29 @@ def calculate_risk():
         # Use liquidation price as strike, or default to 90% of current price
         strike_price = liquidation_price if liquidation_price > 0 else current_asset_price * 0.9
         
-        # Calculate Black-Scholes price using mibian
-        bs_price = black_scholes(
+        # For liquidation insurance, we always use PUT options (protection against price decline)
+        # The user's option_type selection is for reference, but insurance is always a put
+        insurance_option_type = 'put'
+        
+        # Calculate option price using Black-Scholes (this is what we're determining automatically)
+        option_price = black_scholes(
             S=current_asset_price,
             K=strike_price,
             days_to_expiration=days_to_expiration,
             r=risk_free_rate,
             sigma=volatility,
-            option_type=option_type
+            option_type=insurance_option_type
         )
+        
+        # Debug logging
+        print(f"DEBUG: current_price={current_asset_price}, strike={strike_price}, days={days_to_expiration}, vol={volatility}, rate={risk_free_rate}")
+        print(f"DEBUG: option_price={option_price}, insurance_amount={insurance_amount}")
+        
+        # If option_price is 0, there's likely an error - check if it's a valid scenario
+        if option_price == 0 and current_asset_price > 0:
+            print(f"WARNING: Option price is 0. This might indicate:")
+            print(f"  - Strike price ({strike_price}) >= Current price ({current_asset_price}) for PUT option")
+            print(f"  - Or an error in mibian calculation")
         
         # Calculate premium using our risk model
         premium = calculate_premium(
@@ -174,7 +196,9 @@ def calculate_risk():
         
         return jsonify({
             'premium': premium,
-            'blackScholesPrice': round(bs_price, 4),
+            'optionPrice': round(option_price, 4),  # The calculated option price
+            'blackScholesPrice': round(option_price, 4),  # Same as option price (for backward compatibility)
+            'currentAssetPrice': current_asset_price,  # Include for debugging
             'strikePrice': strike_price,
             'timeToExpiration': days_to_expiration,  # Return in days
             'volatility': volatility,
