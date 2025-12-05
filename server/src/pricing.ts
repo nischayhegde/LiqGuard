@@ -29,7 +29,7 @@ export interface PricingOutput {
   timeYears: number;
   d1: number;
   d2: number;
-  breachProbability: number;
+  breachProbability: number; // interpreted now as first-hit probability
 }
 
 function erf(x: number): number {
@@ -54,6 +54,43 @@ function normCdf(x: number): number {
   return 0.5 * (1 + erf(x / Math.sqrt(2)));
 }
 
+// First-hit probability for a single barrier (strike) before expiry
+// Using reflection-principle-based approximation for log-price Brownian with drift
+function firstHitProbability(
+  spot: number,
+  strike: number,
+  vol: number,
+  riskFreeRate: number,
+  timeYears: number,
+  callOrPut: CallOrPutSide
+): number {
+  // If already beyond the barrier in the direction that pays out, probability is 1
+  if (callOrPut === "CALL" && spot >= strike) return 1;
+  if (callOrPut === "PUT" && spot <= strike) return 1;
+
+  // If the strike is in the wrong direction (e.g., call with strike below spot), handled above.
+  const logM = Math.log(strike / spot); // positive for up-barrier, negative for down-barrier
+  const h = Math.abs(logM);
+
+  // Drift of log-price
+  const drift = riskFreeRate - 0.5 * vol * vol;
+  const denom = vol * Math.sqrt(timeYears);
+
+  if (denom === 0) {
+    return 0;
+  }
+
+  // Reflection principle formula for first passage of drifted Brownian to a single barrier
+  const term1 = (-h - drift * timeYears) / denom;
+  const term2 = (-h + drift * timeYears) / denom;
+  const expTerm = Math.exp((2 * drift * h) / (vol * vol));
+
+  const prob = normCdf(term1) + expTerm * normCdf(term2);
+
+  // Clamp to [0,1] to avoid numerical spillover
+  return Math.min(1, Math.max(0, prob));
+}
+
 export function toAtomic(amount: number, decimals: number): number {
   return Math.round(amount * 10 ** decimals);
 }
@@ -73,15 +110,21 @@ export function pricePolicy(input: PricingInput): PricingOutput {
     throw new Error("Volatility must be greater than zero");
   }
 
-  const logTerm = Math.log(input.spot / input.strike);
   const volTerm = volatility * Math.sqrt(timeYears);
   const d1 =
-    (logTerm + (riskFreeRate + 0.5 * volatility * volatility) * timeYears) /
+    (Math.log(input.spot / input.strike) +
+      (riskFreeRate + 0.5 * volatility * volatility) * timeYears) /
     volTerm;
   const d2 = d1 - volTerm;
 
-  const breachProbability =
-    input.callOrPut === "CALL" ? normCdf(d2) : normCdf(-d2);
+  const breachProbability = firstHitProbability(
+    input.spot,
+    input.strike,
+    volatility,
+    riskFreeRate,
+    timeYears,
+    input.callOrPut
+  );
 
   const discountedPayout = input.coverage * Math.exp(-riskFreeRate * timeYears);
   const fairPremium = discountedPayout * breachProbability;
