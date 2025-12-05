@@ -1,86 +1,226 @@
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { RPC_URL, PROGRAM_AUTHORITY_KEYPAIR } from "./config";
-import { createPolicy, activatePolicy, closePolicy, UnderlyingAsset, CallOrPut, derivePolicyAddress } from "./helpers";
+import express from "express";
+import cors from "cors";
+import { z } from "zod";
+import { Connection, PublicKey } from "@solana/web3.js";
 
-/**
- * Example usage of the helper functions
- */
-async function main() {
-  // Create connection to devnet
-  const connection = new Connection(RPC_URL, "confirmed");
+import {
+  CallOrPutSide,
+  UnderlyingSymbol,
+  createPolicy,
+  derivePolicyAddress,
+} from "./helpers";
+import {
+  PAYMENT_MINT,
+  PROGRAM_AUTHORITY_PUBKEY,
+  PROGRAM_ID,
+  PYTH_PRICE_FEEDS,
+  RPC_URL,
+  RISK_FREE_RATE,
+  SERVER_PORT,
+  VIG_RATE,
+  VOLATILITY_DEFAULTS,
+} from "./config";
+import { fetchPythPrice } from "./pyth";
+import {
+  STRIKE_PRICE_DECIMALS,
+  TOKEN_DECIMALS,
+  pricePolicy,
+  toAtomic,
+} from "./pricing";
 
-  // Program authority keypair is loaded from config.ts
-  console.log("Using program authority:", PROGRAM_AUTHORITY_KEYPAIR.publicKey.toString());
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-  // Example: Create a policy
-  console.log("Creating policy...");
-  try {
-    // programAuthority is optional - will use loaded keypair automatically
-    const createResult = await createPolicy(connection, {
-      nonce: 1,
-      strikePrice: 100000, // Example: $1000 in basis points
-      expirationDatetime: Math.floor(Date.now() / 1000) + 86400 * 30, // 30 days from now
-      underlyingAsset: UnderlyingAsset.SOL,
-      callOrPut: CallOrPut.Call,
-      coverageAmount: 1000000, // Example: 10 SOL in lamports
-      premium: 100000, // Example: 1 SOL in lamports
-      payoutWallet: new PublicKey("AFsDyH5JNBDfEsiAzgNT2zdvUNL21T4QHSzYZqhZSCb7"), // Replace with actual wallet
-      paymentMint: new PublicKey("2PrZzabMzDhpRd1mtRxqWwQLvQDASjdCYNxcZbNk5hLs"), // SOL mint
-      // programAuthority is optional - will use loaded keypair automatically
-    });
+const connection = new Connection(RPC_URL, "confirmed");
 
-    console.log("Policy created!");
-    console.log("Policy address:", createResult.policyAddress.toString());
-    console.log("Transaction signature:", createResult.signature);
-  } catch (error) {
-    console.error("Error creating policy:", error);
+const quoteSchema = z.object({
+  asset: z.enum(["BTC", "ETH", "SOL"]),
+  callOrPut: z.enum(["CALL", "PUT"]),
+  strikePrice: z.number().positive(),
+  coverage: z.number().positive(),
+  expiration: z.string(),
+  volatility: z.number().positive().optional(),
+  riskFreeRate: z.number().optional(),
+});
+
+const policySchema = quoteSchema.extend({
+  payoutWallet: z.string().min(32),
+  nonce: z.number().optional(),
+});
+
+function parseExpiration(expiration: string): Date {
+  const date = new Date(expiration);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("Invalid expiration datetime");
   }
-
-  // Example: Activate a policy
-  console.log("\nActivating policy...");
-  try {
-    // Derive policy address (you'd normally store this)
-    const [policyAddress] = derivePolicyAddress(authorityKeypair.publicKey, 1);
-
-    // For activation, the payer must be the payout wallet
-    // In a real scenario, you'd use the payout wallet keypair
-    const payoutWalletKeypair = Keypair.generate(); // Replace with actual payout wallet
-
-    const activateResult = await activatePolicy(connection, {
-      policyAddress,
-      payer: payoutWalletKeypair,
-    });
-
-    console.log("Policy activated!");
-    console.log("Transaction signature:", activateResult.signature);
-  } catch (error) {
-    console.error("Error activating policy:", error);
-  }
-
-  // Example: Close a policy
-  console.log("\nClosing policy...");
-  try {
-    // Derive policy address (you'd normally store this)
-    // Note: Policy PDA is derived from program authority
-    const [policyAddress] = derivePolicyAddress(PROGRAM_AUTHORITY_KEYPAIR.publicKey, 1);
-
-    // programAuthority is optional - will use loaded keypair automatically
-    const closeResult = await closePolicy(connection, {
-      policyAddress,
-      payout: true,
-      // programAuthority is optional - will use loaded keypair automatically
-    });
-
-    console.log("Policy closed!");
-    console.log("Transaction signature:", closeResult.signature);
-  } catch (error) {
-    console.error("Error closing policy:", error);
-  }
+  return date;
 }
 
-// Run if this file is executed directly
-if (require.main === module) {
-  main().catch(console.error);
-}
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    programId: PROGRAM_ID.toBase58(),
+    authority: PROGRAM_AUTHORITY_PUBKEY.toBase58(),
+    paymentMint: PAYMENT_MINT.toBase58(),
+  });
+});
 
-export { createPolicy, activatePolicy, closePolicy, derivePolicyAddress, UnderlyingAsset, CallOrPut };
+app.get("/config", (_req, res) => {
+  res.json({
+    programId: PROGRAM_ID.toBase58(),
+    authority: PROGRAM_AUTHORITY_PUBKEY.toBase58(),
+    paymentMint: PAYMENT_MINT.toBase58(),
+    pythFeeds: PYTH_PRICE_FEEDS,
+    vigRate: VIG_RATE,
+    riskFreeRate: RISK_FREE_RATE,
+    volatilityDefaults: VOLATILITY_DEFAULTS,
+    decimals: {
+      strike: STRIKE_PRICE_DECIMALS,
+      token: TOKEN_DECIMALS,
+    },
+  });
+});
+
+app.get("/price/:asset", async (req, res) => {
+  try {
+    const asset = req.params.asset.toUpperCase() as UnderlyingSymbol;
+    if (!["BTC", "ETH", "SOL"].includes(asset)) {
+      return res.status(400).json({ error: "Unsupported asset" });
+    }
+
+    const oracle = await fetchPythPrice(asset);
+    res.json({
+      asset,
+      price: oracle.price,
+      conf: oracle.conf,
+      expo: oracle.expo,
+      publishTime: oracle.publishTime,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message ?? "Failed to fetch price" });
+  }
+});
+
+app.post("/quote", async (req, res) => {
+  try {
+    const parsed = quoteSchema.parse(req.body);
+    const expiration = parseExpiration(parsed.expiration);
+    const asset = parsed.asset as UnderlyingSymbol;
+    const callOrPut = parsed.callOrPut as CallOrPutSide;
+
+    const oracle = await fetchPythPrice(asset);
+    const pricing = pricePolicy({
+      asset,
+      callOrPut,
+      spot: oracle.price,
+      strike: parsed.strikePrice,
+      coverage: parsed.coverage,
+      expiration,
+      volatility: parsed.volatility,
+      riskFreeRate: parsed.riskFreeRate,
+    });
+
+    const strikePriceAtomic = toAtomic(
+      parsed.strikePrice,
+      STRIKE_PRICE_DECIMALS
+    );
+    const coverageAtomic = toAtomic(parsed.coverage, TOKEN_DECIMALS);
+    const premiumAtomic = toAtomic(pricing.totalPremium, TOKEN_DECIMALS);
+
+    res.json({
+      asset,
+      callOrPut,
+      spot: oracle.price,
+      strikePrice: parsed.strikePrice,
+      coverage: parsed.coverage,
+      expiration: expiration.toISOString(),
+      pricing,
+      chainValues: {
+        strikePriceAtomic,
+        coverageAtomic,
+        premiumAtomic,
+        paymentMint: PAYMENT_MINT.toBase58(),
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.flatten() });
+    }
+    res.status(400).json({ error: error.message ?? "Failed to create quote" });
+  }
+});
+
+app.post("/policies", async (req, res) => {
+  try {
+    const parsed = policySchema.parse(req.body);
+    const expiration = parseExpiration(parsed.expiration);
+    const asset = parsed.asset as UnderlyingSymbol;
+    const callOrPut = parsed.callOrPut as CallOrPutSide;
+
+    const oracle = await fetchPythPrice(asset);
+    const pricing = pricePolicy({
+      asset,
+      callOrPut,
+      spot: oracle.price,
+      strike: parsed.strikePrice,
+      coverage: parsed.coverage,
+      expiration,
+      volatility: parsed.volatility,
+      riskFreeRate: parsed.riskFreeRate,
+    });
+
+    const strikePriceAtomic = toAtomic(
+      parsed.strikePrice,
+      STRIKE_PRICE_DECIMALS
+    );
+    const coverageAtomic = toAtomic(parsed.coverage, TOKEN_DECIMALS);
+    const premiumAtomic = toAtomic(pricing.totalPremium, TOKEN_DECIMALS);
+
+    const { policyAddress, signature } = await createPolicy(connection, {
+      nonce: parsed.nonce ?? Math.floor(Date.now() / 1000),
+      strikePrice: strikePriceAtomic,
+      expirationDatetime: Math.floor(expiration.getTime() / 1000),
+      underlyingAsset: asset,
+      callOrPut,
+      coverageAmount: coverageAtomic,
+      premium: premiumAtomic,
+      payoutWallet: new PublicKey(parsed.payoutWallet),
+      paymentMint: PAYMENT_MINT,
+    });
+
+    res.json({
+      policyAddress: policyAddress.toBase58(),
+      createSignature: signature,
+      paymentMint: PAYMENT_MINT.toBase58(),
+      strikePriceAtomic,
+      coverageAtomic,
+      premiumAtomic,
+      oracle,
+      pricing,
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.flatten() });
+    }
+    res
+      .status(400)
+      .json({ error: error.message ?? "Failed to create policy" });
+  }
+});
+
+app.use((err: any, _req: any, res: any, _next: any) => {
+  console.error(err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+app.listen(SERVER_PORT, () => {
+  console.log(`LiqGuard server listening on port ${SERVER_PORT}`);
+});
+
+export {
+  createPolicy,
+  derivePolicyAddress,
+  CallOrPutSide,
+  UnderlyingSymbol,
+};
