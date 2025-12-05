@@ -1,7 +1,13 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::{AssociatedToken, get_associated_token_address};
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 declare_id!("D7hq6vJ7J9BkzZc8iXuGRynsTdXGiRcCWzyBPgPe9FNy");
+
+// Program authority - only this address can create and close policies
+// TODO: Replace with your actual program authority public key
+// This should be the public key of the keypair that will sign create_policy and close_policy transactions
+const PROGRAM_AUTHORITY: Pubkey = Pubkey::from_str_const("GhgQwWfyZqjjaDBtVUmmc3rg9NEX9qQYhew1ACFRJmp8");
 
 #[program]
 pub mod policyfactory {
@@ -24,7 +30,12 @@ pub mod policyfactory {
         require!(coverage_amount > 0, ErrorCode::InvalidAmount);
         require!(strike_price > 0, ErrorCode::InvalidAmount);
 
-        // Authority check is handled by the Signer constraint
+        // Verify the caller is the program authority
+        require!(
+            ctx.accounts.authority.key() == PROGRAM_AUTHORITY,
+            ErrorCode::UnauthorizedProgramAuthority
+        );
+
         let policy = &mut ctx.accounts.policy;
         
         policy.authority = ctx.accounts.authority.key();
@@ -75,23 +86,14 @@ pub mod policyfactory {
             ErrorCode::InsufficientBalance
         );
 
-        // Verify token accounts match the policy's payment mint
-        require!(
-            ctx.accounts.payer_token_account.mint == policy.payment_mint,
-            ErrorCode::TokenMintMismatch
+        // Verify authority token account is the correct ATA for policy.authority
+        // (The associated_token constraint handles payer_token_account verification)
+        let expected_ata = get_associated_token_address(
+            &policy.authority,
+            &policy.payment_mint
         );
         require!(
-            ctx.accounts.authority_token_account.mint == policy.payment_mint,
-            ErrorCode::TokenMintMismatch
-        );
-
-        // Verify token account ownership
-        require!(
-            ctx.accounts.payer_token_account.owner == ctx.accounts.payer.key(),
-            ErrorCode::InvalidTokenAccount
-        );
-        require!(
-            ctx.accounts.authority_token_account.owner == policy.authority,
+            ctx.accounts.authority_token_account.key() == expected_ata,
             ErrorCode::InvalidTokenAccount
         );
 
@@ -119,31 +121,31 @@ pub mod policyfactory {
     pub fn close_policy(ctx: Context<ClosePolicy>, payout: bool) -> Result<()> {
         let policy = &ctx.accounts.policy;
 
-        // Verify the caller is the policy authority (program owner)
+        // Verify the caller is the program authority
         require!(
-            ctx.accounts.authority.key() == policy.authority,
-            ErrorCode::UnauthorizedAuthority
+            ctx.accounts.authority.key() == PROGRAM_AUTHORITY,
+            ErrorCode::UnauthorizedProgramAuthority
         );
 
         // Only payout if policy is active AND payout is requested
         if payout && policy.status == PolicyStatus::Active {
-            // Verify token accounts match the policy's payment mint
-            require!(
-                ctx.accounts.authority_token_account.mint == policy.payment_mint,
-                ErrorCode::TokenMintMismatch
+            // Verify authority token account is the correct ATA for policy.authority
+            let expected_authority_ata = get_associated_token_address(
+                &policy.authority,
+                &policy.payment_mint
             );
             require!(
-                ctx.accounts.payout_token_account.mint == policy.payment_mint,
-                ErrorCode::TokenMintMismatch
-            );
-
-            // Verify token account ownership
-            require!(
-                ctx.accounts.authority_token_account.owner == policy.authority,
+                ctx.accounts.authority_token_account.key() == expected_authority_ata,
                 ErrorCode::InvalidTokenAccount
             );
+
+            // Verify payout token account is the correct ATA for policy.payout_wallet
+            let expected_payout_ata = get_associated_token_address(
+                &policy.payout_wallet,
+                &policy.payment_mint
+            );
             require!(
-                ctx.accounts.payout_token_account.owner == policy.payout_wallet,
+                ctx.accounts.payout_token_account.key() == expected_payout_ata,
                 ErrorCode::InvalidTokenAccount
             );
 
@@ -198,13 +200,18 @@ pub struct ActivatePolicy<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     
-    #[account(mut)]
+    #[account(
+        mut,
+        associated_token::mint = policy.payment_mint,
+        associated_token::authority = payer
+    )]
     pub payer_token_account: Account<'info, TokenAccount>,
     
     #[account(mut)]
     pub authority_token_account: Account<'info, TokenAccount>,
     
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
 #[derive(Accounts)]
@@ -222,6 +229,7 @@ pub struct ClosePolicy<'info> {
     pub payout_token_account: Account<'info, TokenAccount>,
     
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
 #[account]
@@ -284,6 +292,8 @@ pub enum ErrorCode {
     PolicyNotActive,
     #[msg("Unauthorized authority - only policy authority can call this instruction")]
     UnauthorizedAuthority,
+    #[msg("Unauthorized program authority - only program authority can call this instruction")]
+    UnauthorizedProgramAuthority,
     #[msg("Insufficient balance - payer does not have enough tokens to pay the premium")]
     InsufficientBalance,
     #[msg("Token mint mismatch - token accounts must match the policy's payment mint")]

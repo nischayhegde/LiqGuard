@@ -8,6 +8,9 @@ skip-lint = false
 [programs.localnet]
 policyfactory = "D7hq6vJ7J9BkzZc8iXuGRynsTdXGiRcCWzyBPgPe9FNy"
 
+[programs.devnet]
+policyfactory = "D7hq6vJ7J9BkzZc8iXuGRynsTdXGiRcCWzyBPgPe9FNy"
+
 [registry]
 url = "https://api.apr.dev"
 

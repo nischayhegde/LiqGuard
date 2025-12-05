@@ -5,8 +5,8 @@ import {
   SystemProgram,
 } from "@solana/web3.js";
 import { Program, AnchorProvider, Wallet, BN } from "@coral-xyz/anchor";
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { PROGRAM_ID, PROGRAM_AUTHORITY, RPC_URL } from "./config";
+import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { PROGRAM_ID, PROGRAM_AUTHORITY_KEYPAIR } from "./config";
 import { Policyfactory } from "./idl";
 
 // Types matching the smart contract
@@ -34,12 +34,17 @@ export interface CreatePolicyParams {
   authority: Keypair; // The authority keypair (signer)
 }
 
+export interface ActivatePolicyParams {
+  policyAddress: PublicKey;
+  payer: Keypair; // The payer keypair (must be the payout wallet)
+  idl?: Policyfactory;
+}
+
 export interface ClosePolicyParams {
   policyAddress: PublicKey;
   payout: boolean;
-  authorityTokenAccount: PublicKey;
-  payoutTokenAccount: PublicKey;
-  authority: Keypair; // The authority keypair (signer)
+  programAuthority?: Keypair; // Optional: defaults to loaded program authority from config
+  idl?: Policyfactory;
 }
 
 /**
@@ -100,17 +105,21 @@ export async function createPolicy(
   params: CreatePolicyParams,
   idl?: Policyfactory
 ): Promise<{ signature: string; policyAddress: PublicKey }> {
-  // Derive the policy PDA
+  // Use provided program authority or use from config
+  const programAuthority = params.programAuthority || PROGRAM_AUTHORITY_KEYPAIR;
+
+  // Derive the policy PDA using program authority
   const [policyAddress] = derivePolicyAddress(
-    params.authority.publicKey,
+    programAuthority.publicKey,
     params.nonce
   );
 
-  // Create a wallet from the authority keypair
-  const wallet = new Wallet(params.authority);
+  // Create a wallet from the program authority keypair
+  const wallet = new Wallet(programAuthority);
   const program = getProgram(connection, wallet, idl);
 
   // Call the create_policy instruction
+  // Note: Only the program authority can create policies
   const tx = await program.methods
     .createPolicy(
       new BN(params.nonce),
@@ -125,7 +134,7 @@ export async function createPolicy(
     )
     .accounts({
       policy: policyAddress,
-      authority: params.authority.publicKey,
+      authority: programAuthority.publicKey,
       systemProgram: SystemProgram.programId,
     })
     .rpc();
@@ -134,29 +143,97 @@ export async function createPolicy(
 }
 
 /**
- * Closes a policy using the close_policy instruction (third instruction)
+ * Activates a policy using the activate_policy instruction
+ * @param connection - Solana connection
+ * @param params - Parameters for activating the policy
+ * @returns Transaction signature
+ */
+export async function activatePolicy(
+  connection: Connection,
+  params: ActivatePolicyParams
+): Promise<{ signature: string }> {
+  const wallet = new Wallet(params.payer);
+  const program = getProgram(connection, wallet, params.idl);
+
+  // Fetch the policy account to get payment_mint and authority
+  const policyAccount = await program.account.policy.fetch(params.policyAddress);
+  const paymentMint = policyAccount.paymentMint as PublicKey;
+  const authority = policyAccount.authority as PublicKey;
+
+  // Automatically derive token account addresses
+  const payerTokenAccount = getAssociatedTokenAddress(
+    paymentMint,
+    params.payer.publicKey
+  );
+  
+  const authorityTokenAccount = getAssociatedTokenAddress(
+    paymentMint,
+    authority
+  );
+
+  // Call the activate_policy instruction
+  // Anchor SDK will automatically derive payer_token_account via associated_token constraint
+  const tx = await program.methods
+    .activatePolicy()
+    .accounts({
+      policy: params.policyAddress,
+      payer: params.payer.publicKey,
+      payerTokenAccount: payerTokenAccount,
+      authorityTokenAccount: authorityTokenAccount,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+    })
+    .rpc();
+
+  return { signature: tx };
+}
+
+/**
+ * Closes a policy using the close_policy instruction
  * @param connection - Solana connection
  * @param params - Parameters for closing the policy
- * @param idl - Program IDL (optional)
  * @returns Transaction signature
  */
 export async function closePolicy(
   connection: Connection,
-  params: ClosePolicyParams,
-  idl?: Policyfactory
+  params: ClosePolicyParams
 ): Promise<{ signature: string }> {
-  const wallet = new Wallet(params.authority);
-  const program = getProgram(connection, wallet, idl);
+  // Use provided program authority or use from config
+  const programAuthority = params.programAuthority || PROGRAM_AUTHORITY_KEYPAIR;
+
+  // Create a wallet from the program authority keypair
+  // Note: Only the program authority can close policies
+  const wallet = new Wallet(programAuthority);
+  const program = getProgram(connection, wallet, params.idl);
+
+  // Fetch the policy account to get payment_mint, authority, and payout_wallet
+  const policyAccount = await program.account.policy.fetch(params.policyAddress);
+  const paymentMint = policyAccount.paymentMint as PublicKey;
+  const authority = policyAccount.authority as PublicKey; // This will be the program authority
+  const payoutWallet = policyAccount.payoutWallet as PublicKey;
+
+  // Automatically derive token account addresses
+  // authorityTokenAccount is the ATA for the program authority (who holds the coverage funds)
+  const authorityTokenAccount = getAssociatedTokenAddress(
+    paymentMint,
+    authority
+  );
+  
+  const payoutTokenAccount = getAssociatedTokenAddress(
+    paymentMint,
+    payoutWallet
+  );
 
   // Call the close_policy instruction
   const tx = await program.methods
     .closePolicy(params.payout)
     .accounts({
       policy: params.policyAddress,
-      authority: params.authority.publicKey,
-      authorityTokenAccount: params.authorityTokenAccount,
-      payoutTokenAccount: params.payoutTokenAccount,
+      authority: programAuthority.publicKey,
+      authorityTokenAccount: authorityTokenAccount,
+      payoutTokenAccount: payoutTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
     })
     .rpc();
 
