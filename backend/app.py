@@ -1,35 +1,84 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-# Check if scipy is available (required by mibian)
-try:
-    import scipy.stats
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
-    print("ERROR: scipy is not installed. mibian requires scipy to work properly.")
-    print("Please install scipy: pip install scipy")
-
-try:
-    import mibian
-    # Test if mibian actually works (it needs scipy at runtime)
-    try:
-        test_calc = mibian.BS([100, 90, 5, 30], volatility=30)
-        MIBIAN_AVAILABLE = True
-        print("mibian is available and working")
-    except Exception as e:
-        MIBIAN_AVAILABLE = False
-        print(f"ERROR: mibian imported but cannot calculate (likely missing scipy): {e}")
-except ImportError:
-    MIBIAN_AVAILABLE = False
-    print("ERROR: mibian is not installed. Please install: pip install mibian")
+import math
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend communication
 
+def normal_cdf(x: float) -> float:
+    """Standard normal CDF using the error function (no scipy needed)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def touch_prob_down(spot: float, barrier: float, T: float, sigma: float) -> float:
+    """
+    Approx probability that a LOWER barrier is touched before time T
+    under a driftless log-Brownian approximation.
+    Requires: barrier < spot.
+    """
+    if barrier >= spot:
+        raise ValueError("For down-touch, barrier must be < spot.")
+    if T <= 0 or sigma <= 0:
+        raise ValueError("T and sigma must be positive.")
+    
+    z = math.log(barrier / spot) / (sigma * math.sqrt(T))
+    # Formula from reflection principle for minimum of Brownian motion
+    p_touch = 2.0 * normal_cdf(z)
+    # z is negative, so this is between 0 and 1
+    return p_touch
+
+def touch_prob_up(spot: float, barrier: float, T: float, sigma: float) -> float:
+    """
+    Approx probability that an UPPER barrier is touched before time T
+    under a driftless log-Brownian approximation.
+    Requires: barrier > spot.
+    """
+    if barrier <= spot:
+        raise ValueError("For up-touch, barrier must be > spot.")
+    if T <= 0 or sigma <= 0:
+        raise ValueError("T and sigma must be positive.")
+    
+    z = math.log(barrier / spot) / (sigma * math.sqrt(T))
+    # Probability to ever reach the upper barrier before T
+    p_touch = 2.0 * normal_cdf(-z)
+    return p_touch
+
+def one_touch_premium(
+    spot: float,
+    barrier: float,
+    days_to_expiry: float,
+    coverage: float,
+    sigma: float,
+    r: float = 0.0,
+    days_in_year: float = 365.0,
+) -> float:
+    """
+    Price a one-touch (barrier) insurance contract that pays `coverage`
+    if the price EVER hits `barrier` before expiry.
+    Automatically chooses down-touch vs up-touch based on barrier vs spot.
+    """
+    T = days_to_expiry / days_in_year
+    
+    if barrier < spot:
+        p_touch = touch_prob_down(spot, barrier, T, sigma)
+    elif barrier > spot:
+        p_touch = touch_prob_up(spot, barrier, T, sigma)
+    else:
+        # If barrier == spot, we assume immediate touch (prob ~1)
+        p_touch = 1.0
+    
+    premium = coverage * math.exp(-r * T) * p_touch
+    return premium
+
+def d1_d2(spot: float, strike: float, T: float, sigma: float, r: float):
+    """Helper to compute Black–Scholes d1 and d2 (for regular option price display)."""
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma**2) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    return d1, d2
+
 def black_scholes(S, K, days_to_expiration, r, sigma, option_type='call'):
     """
-    Calculate Black-Scholes option price using mibian library
+    Calculate Black-Scholes option price using pure Python implementation
     
     Parameters:
     S: Current stock/asset price
@@ -42,70 +91,74 @@ def black_scholes(S, K, days_to_expiration, r, sigma, option_type='call'):
     Returns:
     Option price
     """
-    if not SCIPY_AVAILABLE or not MIBIAN_AVAILABLE:
-        print("ERROR: scipy or mibian not available. Cannot calculate option price.")
-        return 0
-    
     if days_to_expiration <= 0:
         return 0
     
     # Validate inputs
     if S <= 0 or K <= 0:
-        print(f"ERROR: Invalid prices - S={S}, K={K}")
         return 0
     
     try:
-        # mibian.BS expects: [underlying_price, strike_price, interest_rate_percent, days_to_expiration]
-        # Interest rate and volatility should be in percentage form (e.g., 5 for 5%, 30 for 30%)
-        # Time is in days
-        c = mibian.BS([S, K, r * 100, days_to_expiration], volatility=sigma * 100)
+        T = days_to_expiration / 365.0
+        d1, d2 = d1_d2(S, K, T, sigma, r)
         
         if option_type.lower() == 'call':
-            price = c.callPrice
+            price = S * normal_cdf(d1) - K * math.exp(-r * T) * normal_cdf(d2)
         else:
-            price = c.putPrice
+            price = K * math.exp(-r * T) * normal_cdf(-d2) - S * normal_cdf(-d1)
         
         return max(price, 0)  # Ensure non-negative price
     except Exception as e:
-        # Fallback to 0 if calculation fails - log the full error
-        import traceback
         print(f"Error in Black-Scholes calculation: {e}")
-        print(f"Parameters: S={S}, K={K}, days={days_to_expiration}, r={r}, sigma={sigma}, type={option_type}")
-        traceback.print_exc()
         return 0
 
-def calculate_premium(option_price, insurance_amount, liquidation_price, current_price, volatility=0.3, risk_free_rate=0.05, days_to_expiration=30):
+def calculate_premium(insurance_amount, liquidation_price, current_price, volatility=0.3, risk_free_rate=0.05, days_to_expiration=30):
     """
-    Calculate insurance premium based on option price and coverage amount
+    Calculate insurance premium using one-touch barrier option pricing
     
     Parameters:
-    option_price: Current price of the option (calculated via Black-Scholes)
-    insurance_amount: Amount of insurance coverage requested
-    liquidation_price: Price at which liquidation occurs
-    current_price: Current market price of the underlying asset
+    insurance_amount: Amount of insurance coverage requested (coverage amount)
+    liquidation_price: Price at which liquidation occurs (barrier price)
+    current_price: Current market price of the underlying asset (spot price)
     volatility: Annual volatility (default 0.3 = 30%)
     risk_free_rate: Risk-free interest rate (default 0.05 = 5%)
     days_to_expiration: Days to expiration (default 30)
     
     Returns:
-    Premium amount
+    Premium amount (one-touch barrier option price)
     """
-    if option_price <= 0 or insurance_amount <= 0 or current_price <= 0:
+    if insurance_amount <= 0 or current_price <= 0:
         return 0
     
-    # The premium is the option price scaled by the coverage ratio
-    # Premium = option_price * (insurance_amount / current_price)
-    # This represents the cost to insure the insurance_amount worth of assets
+    # Use liquidation price as barrier, or default to 90% of current price
+    barrier_price = liquidation_price if liquidation_price > 0 else current_price * 0.9
     
-    coverage_ratio = insurance_amount / current_price
-    premium = option_price * coverage_ratio
+    try:
+        # Calculate premium using one-touch barrier option pricing
+        # One-touch pays out coverage amount if price EVER touches barrier before expiry
+        premium = one_touch_premium(
+            spot=current_price,
+            barrier=barrier_price,
+            days_to_expiry=days_to_expiration,
+            coverage=insurance_amount,
+            sigma=volatility,
+            r=risk_free_rate,
+            days_in_year=365.0
+        )
+    except ValueError as e:
+        # Handle edge cases (e.g., barrier == spot)
+        print(f"Warning in premium calculation: {e}")
+        # If barrier equals or exceeds spot for down-touch, premium should be high
+        if barrier_price >= current_price:
+            # Very high risk - premium approaches coverage amount
+            premium = insurance_amount * 0.95
+        else:
+            premium = 0
     
-    # Add a small risk premium based on volatility and time to expiration
-    # Higher volatility and longer time = higher risk premium
-    risk_premium_factor = 1 + (volatility * 0.1) + (days_to_expiration / 365.0 * 0.05)
-    premium = premium * risk_premium_factor
+    # Add 20% vig (house edge) for profit
+    premium_with_vig = premium * 1.20
     
-    return round(premium, 4)
+    return round(premium_with_vig, 4)
 
 @app.route('/calculate-risk', methods=['POST'])
 def calculate_risk():
@@ -163,7 +216,7 @@ def calculate_risk():
         # The user's option_type selection is for reference, but insurance is always a put
         insurance_option_type = 'put'
         
-        # Calculate option price using Black-Scholes (this is what we're determining automatically)
+        # Calculate regular option price using Black-Scholes (for display purposes)
         option_price = black_scholes(
             S=current_asset_price,
             K=strike_price,
@@ -183,9 +236,8 @@ def calculate_risk():
             print(f"  - Strike price ({strike_price}) >= Current price ({current_asset_price}) for PUT option")
             print(f"  - Or an error in mibian calculation")
         
-        # Calculate premium using our risk model
+        # Calculate premium using binary option pricing
         premium = calculate_premium(
-            option_price=option_price,
             insurance_amount=insurance_amount,
             liquidation_price=liquidation_price,
             current_price=current_asset_price,
