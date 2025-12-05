@@ -124,8 +124,7 @@ function App() {
           `You have: ${balanceInEth.toFixed(6)} ETH\n` +
           `Premium requires: ${premiumInEth.toFixed(6)} ETH ($${premiumInUSD.toFixed(2)})\n` +
           `Need: ${shortfall.toFixed(6)} ETH more\n\n` +
-          `Get testnet ETH from a faucet:\n` +
-          `- Base Sepolia: https://www.coinbase.com/faucets/base-ethereum-goerli-faucet`
+          `Make sure you have sufficient ETH in your wallet.`
         )
       }
       

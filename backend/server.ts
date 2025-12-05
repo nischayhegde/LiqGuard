@@ -12,9 +12,8 @@ app.use(express.json());
 
 // Configuration
 const PORT = process.env.PORT || 5000;
-// Support both Ethereum Sepolia and Base Sepolia
-const RPC_URL = process.env.RPC_URL || 'https://sepolia.base.org'; // Base Sepolia testnet (default)
-// For Ethereum Sepolia, use: https://sepolia.infura.io/v3/YOUR_INFURA_KEY
+// Base mainnet RPC URL
+const RPC_URL = process.env.RPC_URL || 'https://mainnet.base.org'; // Base mainnet (default)
 const SENDER_WALLET_PRIVATE_KEY = process.env.SENDER_WALLET_PRIVATE_KEY || '';
 const SENDER_WALLET_ADDRESS = process.env.SENDER_WALLET_ADDRESS || '';
 
