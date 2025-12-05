@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 function App() {
   const [formData, setFormData] = useState({
@@ -15,13 +15,84 @@ function App() {
   const [error, setError] = useState(null)
   const [showChart, setShowChart] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+  const [policyRegistered, setPolicyRegistered] = useState(false)
+  const [currentSolPrice, setCurrentSolPrice] = useState(null)
+  const [priceLoading, setPriceLoading] = useState(true)
+
+  // Fetch current SOL price from backend
+  useEffect(() => {
+    const fetchSolPrice = async () => {
+      try {
+        const response = await fetch('http://localhost:5000/current-price')
+        if (response.ok) {
+          const data = await response.json()
+          const price = data.price
+          setCurrentSolPrice(price)
+          // Auto-populate current asset price with SOL price and recalculate option type
+          setFormData(prev => {
+            const updated = {
+              ...prev,
+              currentAssetPrice: price.toFixed(2)
+            }
+            
+            // Auto-determine option type based on liquidation price vs current price
+            const liquidationPrice = parseFloat(prev.liquidationPrice) || 0
+            if (liquidationPrice > 0 && price > 0) {
+              if (liquidationPrice > price) {
+                updated.optionType = 'call'
+              } else if (liquidationPrice < price) {
+                updated.optionType = 'put'
+              }
+            }
+            
+            return updated
+          })
+          setPriceLoading(false)
+        } else {
+          setPriceLoading(false)
+        }
+      } catch (err) {
+        console.error('Failed to fetch SOL price:', err)
+        setPriceLoading(false)
+      }
+    }
+
+    // Fetch immediately
+    fetchSolPrice()
+
+    // Then fetch every 5 seconds to keep price updated
+    const interval = setInterval(fetchSolPrice, 5000)
+
+    return () => clearInterval(interval)
+  }, [])
 
   const handleInputChange = (e) => {
     const { name, value } = e.target
-    setFormData(prev => ({
-      ...prev,
-      [name]: value
-    }))
+    setFormData(prev => {
+      const updated = {
+        ...prev,
+        [name]: value
+      }
+      
+      // Automatically determine option type based on liquidation price vs current price
+      if (name === 'liquidationPrice' || name === 'currentAssetPrice') {
+        const liquidationPrice = parseFloat(name === 'liquidationPrice' ? value : updated.liquidationPrice) || 0
+        const currentPrice = parseFloat(name === 'currentAssetPrice' ? value : updated.currentAssetPrice) || 0
+        
+        if (liquidationPrice > 0 && currentPrice > 0) {
+          // If liquidation price > current price: CALL option (protection against price increase)
+          // If liquidation price < current price: PUT option (protection against price decline)
+          if (liquidationPrice > currentPrice) {
+            updated.optionType = 'call'
+          } else if (liquidationPrice < currentPrice) {
+            updated.optionType = 'put'
+          }
+          // If equal, keep current option type
+        }
+      }
+      
+      return updated
+    })
     setError(null)
   }
 
@@ -33,11 +104,13 @@ function App() {
     if (insurance <= 0 || assetPrice <= 0) {
       setCalculatedPremium(null)
       setPremiumData(null)
+      setPolicyRegistered(false)
       return
     }
 
     setLoading(true)
     setError(null)
+    setPolicyRegistered(false) // Reset when recalculating
 
     try {
       const response = await fetch('http://localhost:5000/calculate-risk', {
@@ -62,10 +135,39 @@ function App() {
       const result = await response.json()
       setCalculatedPremium(result.premium.toFixed(4))
       setPremiumData(result)
+      
+      // Automatically register policy for monitoring if liquidation price is provided
+      const liquidationPrice = parseFloat(data.liquidationPrice) || 0
+      if (liquidationPrice > 0) {
+        try {
+          const registerResponse = await fetch('http://localhost:5000/register-policy', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              liquidationPrice: liquidationPrice,
+              optionType: data.optionType,
+              insuranceAmount: insurance,
+              expirationDate: data.expirationDate || null,
+            }),
+          })
+          
+          if (registerResponse.ok) {
+            const registerResult = await registerResponse.json()
+            setPolicyRegistered(true)
+            console.log('✅ Policy registered for monitoring:', registerResult.policyId)
+          }
+        } catch (registerErr) {
+          console.error('Failed to register policy for monitoring:', registerErr)
+          // Don't show error to user, just log it
+        }
+      }
     } catch (err) {
       setError(err.message)
       setCalculatedPremium(null)
       setPremiumData(null)
+      setPolicyRegistered(false)
     } finally {
       setLoading(false)
     }
@@ -100,21 +202,47 @@ function App() {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Current Asset Price */}
+            {/* Current Asset Price (SOL) */}
             <div>
-              <label className="block text-sm text-gray-400 mb-2">Current Asset Price (USD) *</label>
-              <input
-                type="number"
-                name="currentAssetPrice"
-                value={formData.currentAssetPrice}
-                onChange={handleInputChange}
-                placeholder="0.00"
-                step="0.0001"
-                min="0"
-                required
-                className="w-full bg-[#1a1f35] border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-gray-600 transition-colors"
-              />
-              <p className="mt-1 text-xs text-gray-500">Current market price of the underlying asset</p>
+              <label className="block text-sm text-gray-400 mb-2">
+                Current SOL Price (USD) *
+                {currentSolPrice && (
+                  <span className="ml-2 text-green-400 text-xs">
+                    (Live: ${currentSolPrice.toFixed(2)})
+                  </span>
+                )}
+              </label>
+              <div className="relative">
+                <input
+                  type="number"
+                  name="currentAssetPrice"
+                  value={formData.currentAssetPrice}
+                  onChange={handleInputChange}
+                  placeholder={priceLoading ? "Loading..." : "0.00"}
+                  step="0.01"
+                  min="0"
+                  required
+                  disabled={priceLoading}
+                  className="w-full bg-[#1a1f35] border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+                {currentSolPrice && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormData(prev => ({
+                        ...prev,
+                        currentAssetPrice: currentSolPrice.toFixed(2)
+                      }))
+                    }}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded hover:bg-green-500/30 transition-colors"
+                  >
+                    Use Live Price
+                  </button>
+                )}
+              </div>
+              <p className="mt-1 text-xs text-gray-500">
+                {priceLoading ? 'Fetching current SOL price...' : 'Automatically updated from Pyth Network'}
+              </p>
             </div>
 
             {/* Liquidation Price */}
@@ -134,16 +262,33 @@ function App() {
 
             {/* Option Type */}
             <div>
-              <label className="block text-sm text-gray-400 mb-2">Option Type</label>
+              <label className="block text-sm text-gray-400 mb-2">
+                Option Type
+                {formData.liquidationPrice && formData.currentAssetPrice && (
+                  <span className="ml-2 text-xs text-gray-500">
+                    (Auto-selected: {formData.optionType === 'call' 
+                      ? 'Call - Protection if price rises above liquidation' 
+                      : 'Put - Protection if price falls below liquidation'})
+                  </span>
+                )}
+              </label>
               <select
                 name="optionType"
                 value={formData.optionType}
                 onChange={handleInputChange}
                 className="w-full bg-[#1a1f35] border border-gray-700 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-gray-600 transition-colors"
               >
-                <option value="call">Call Option</option>
-                <option value="put">Put Option</option>
+                <option value="call">Call Option (Price rises above liquidation)</option>
+                <option value="put">Put Option (Price falls below liquidation)</option>
               </select>
+              {formData.liquidationPrice && formData.currentAssetPrice && (
+                <p className="mt-1 text-xs text-gray-500">
+                  {formData.optionType === 'call' 
+                    ? `Call option selected: Protection if SOL price rises above $${parseFloat(formData.liquidationPrice).toFixed(2)}`
+                    : `Put option selected: Protection if SOL price falls below $${parseFloat(formData.liquidationPrice).toFixed(2)}`
+                  }
+                </p>
+              )}
             </div>
 
             {/* Expiration Date */}
@@ -197,6 +342,21 @@ function App() {
                     </p>
                   </div>
                 </div>
+                {policyRegistered && formData.liquidationPrice && (
+                  <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+                    <div className="flex items-center gap-2">
+                      <svg className="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <div>
+                        <p className="text-green-400 text-sm font-semibold">Monitoring Active</p>
+                        <p className="text-gray-400 text-xs">
+                          Liquidation price: ${parseFloat(formData.liquidationPrice).toFixed(2)} ({formData.optionType === 'call' ? 'Call' : 'Put'} option)
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div className="pt-3 border-t border-gray-700">
                   <div className="grid grid-cols-2 gap-4 text-sm">
                     <div>
@@ -272,8 +432,10 @@ function App() {
             </div>
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-lg font-semibold">${formData.currentAssetPrice || '0.9997'}</div>
-                <div className="text-xs text-red-400">-0.01%</div>
+                <div className="text-lg font-semibold">
+                  {currentSolPrice ? `$${currentSolPrice.toFixed(2)}` : (formData.currentAssetPrice ? `$${formData.currentAssetPrice}` : '$0.9997')}
+                </div>
+                <div className="text-xs text-gray-400">Live Price</div>
               </div>
               <div className="w-20 h-10 flex items-end">
                 <svg viewBox="0 0 100 40" className="w-full h-full">

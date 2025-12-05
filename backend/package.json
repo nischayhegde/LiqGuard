@@ -6,13 +6,13 @@
   "main": "monitor.ts",
   "scripts": {
     "monitor": "tsx monitor.ts",
+    "log-sol": "tsx sol_price_logger.ts",
     "build": "tsc",
     "dev": "tsx watch monitor.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.0",
     "@pythnetwork/hermes-client": "^2.0.0",
-    "@pythnetwork/pyth-solana-receiver": "^1.0.0",
     "@solana/web3.js": "^1.87.6",
     "bs58": "^5.0.0",
     "dotenv": "^16.3.1"

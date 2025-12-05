@@ -1,11 +1,6 @@
 import { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { Program, AnchorProvider, Wallet, BN } from '@coral-xyz/anchor';
 import { HermesClient } from '@pythnetwork/hermes-client';
-import { 
-    addPostPriceUpdates, 
-    PriceUpdateAccount, 
-    PriceFeedUpdateData 
-} from '@pythnetwork/pyth-solana-receiver';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
@@ -20,8 +15,13 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PROGRAM_ID = new PublicKey('Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS');
 const PYTH_PRICE_UPDATE_ACCOUNT = new PublicKey('H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG'); // Pyth Price Update account on Devnet
 
-// BTC/USD Feed ID
-const BTC_FEED_ID = 'e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43';
+// SOL/USD Feed ID (Pyth Network) - Fallback ID
+const FALLBACK_SOL_FEED_ID = 'ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d';
+
+// Liquidation monitoring configuration
+const LIQUIDATION_PRICE = parseFloat(process.env.LIQUIDATION_PRICE || '0');
+const OPTION_TYPE = (process.env.OPTION_TYPE || 'put').toLowerCase(); // 'call' or 'put'
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000';
 
 // Demo trigger prices
 const CRASH_TRIGGER_PRICE = 100000; // Trigger when Price < 100,000 (Long getting wrecked)
@@ -116,8 +116,7 @@ function shouldLiquidate(
 async function executeLiquidation(
     connection: Connection,
     wallet: Keypair,
-    policyOwner: PublicKey,
-    priceUpdateData: PriceFeedUpdateData[]
+    policyOwner: PublicKey
 ): Promise<void> {
     try {
         console.log('📦 Building liquidation transaction...');
@@ -129,13 +128,8 @@ async function executeLiquidation(
         // Create transaction
         const transaction = new Transaction();
         
-        // Add Pyth price update instruction
-        const priceUpdateIx = await addPostPriceUpdates(
-            connection,
-            PYTH_PRICE_UPDATE_ACCOUNT,
-            priceUpdateData
-        );
-        transaction.add(...priceUpdateIx);
+        // Note: Price update instructions would be added here
+        // This requires the pyth-solana-receiver package or manual instruction building
         
         // Add liquidation instruction
         // Note: You'll need to load your IDL and create the instruction
@@ -183,83 +177,196 @@ async function executeLiquidation(
 }
 
 /**
+ * Call /resolve endpoint when liquidation condition is met
+ */
+async function callResolveEndpoint(currentPrice: number, liquidationPrice: number, optionType: string): Promise<void> {
+    try {
+        const response = await fetch(`${BACKEND_URL}/resolve`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                currentPrice: currentPrice,
+                liquidationPrice: liquidationPrice,
+                optionType: optionType,
+                timestamp: new Date().toISOString(),
+            }),
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`❌ /resolve endpoint error (${response.status}):`, errorText);
+        } else {
+            const result = await response.json();
+            console.log('✅ /resolve endpoint called successfully:', result);
+        }
+    } catch (error) {
+        console.error('❌ Error calling /resolve endpoint:', error);
+    }
+}
+
+/**
+ * Check if liquidation condition is met based on option type
+ */
+function checkLiquidationCondition(
+    currentPrice: number,
+    liquidationPrice: number,
+    optionType: string
+): boolean {
+    if (liquidationPrice <= 0) {
+        return false; // No liquidation price set
+    }
+    
+    if (optionType === 'call') {
+        // Call option: liquidate if price goes ABOVE liquidation price
+        return currentPrice > liquidationPrice;
+    } else if (optionType === 'put') {
+        // Put option: liquidate if price goes BELOW liquidation price
+        return currentPrice < liquidationPrice;
+    }
+    
+    return false;
+}
+
+/**
  * Main monitor function
  */
 async function main() {
     console.log('🚀 Starting LiqGuard Monitor...');
     console.log(`📊 Demo Mode: ${DEMO_MODE}`);
     console.log(`🌐 RPC: ${RPC_URL}`);
+    console.log(`🔗 Backend URL: ${BACKEND_URL}`);
+    
+    // Display liquidation monitoring config
+    if (LIQUIDATION_PRICE > 0) {
+        console.log(`\n📊 Liquidation Monitoring:`);
+        console.log(`   Liquidation Price: $${LIQUIDATION_PRICE.toFixed(2)}`);
+        console.log(`   Option Type: ${OPTION_TYPE.toUpperCase()}`);
+        if (OPTION_TYPE === 'call') {
+            console.log(`   Condition: Price > $${LIQUIDATION_PRICE.toFixed(2)}`);
+        } else {
+            console.log(`   Condition: Price < $${LIQUIDATION_PRICE.toFixed(2)}`);
+        }
+    } else {
+        console.log(`\n⚠️  No liquidation price set. Set LIQUIDATION_PRICE env var to enable monitoring.`);
+    }
     
     // Setup
-    const connection = new Connection(RPC_URL, 'confirmed');
+    const solanaConnection = new Connection(RPC_URL, 'confirmed');
     const wallet = loadWallet();
     
     console.log(`👛 Wallet: ${wallet.publicKey.toString()}`);
     
     // Initialize Hermes client
-    const hermesClient = new HermesClient('https://hermes.pyth.network');
+    const hermesClient = new HermesClient('https://hermes.pyth.network', {});
     
-    // Subscribe to BTC/USD price feed
-    console.log(`📡 Subscribing to BTC/USD feed: ${BTC_FEED_ID}`);
-    
-    hermesClient.subscribePriceFeedUpdates([BTC_FEED_ID], (priceFeedUpdate) => {
-        try {
-            // Extract price data
-            const priceInfo = priceFeedUpdate.priceFeed.price;
-            if (!priceInfo) {
-                console.log('⚠️  No price data available');
-                return;
-            }
-            
-            // Normalize price
-            const currentPrice = normalizePrice(
-                priceInfo.price,
-                priceInfo.exponent
-            );
-            
-            const timestamp = Date.now();
-            
-            // Log price update
-            console.log('\n📈 Price Update:');
-            console.log(`   BTC Price: $${currentPrice.toLocaleString()}`);
-            console.log(`   Timestamp: ${new Date(timestamp).toISOString()}`);
-            
-            // Demo mode triggers
-            if (DEMO_MODE === 'CRASH') {
-                const conditionMet = currentPrice < CRASH_TRIGGER_PRICE;
-                console.log(`   Trigger: $${CRASH_TRIGGER_PRICE.toLocaleString()}`);
-                console.log(`   Condition Met? ${conditionMet ? '✅ TRUE' : '❌ FALSE'}`);
-                
-                if (conditionMet) {
-                    console.log('🔥 CRASH MODE: Triggering liquidation...');
-                    // In real implementation, you would:
-                    // 1. Fetch all active policies
-                    // 2. Check each policy's conditions
-                    // 3. Execute liquidations for matching policies
-                }
-            } else if (DEMO_MODE === 'PUMP') {
-                const conditionMet = currentPrice > PUMP_TRIGGER_PRICE;
-                console.log(`   Trigger: $${PUMP_TRIGGER_PRICE.toLocaleString()}`);
-                console.log(`   Condition Met? ${conditionMet ? '✅ TRUE' : '❌ FALSE'}`);
-                
-                if (conditionMet) {
-                    console.log('🚀 PUMP MODE: Triggering liquidation...');
-                    // Same as above
-                }
-            }
-            
-            // In production, you would:
-            // 1. Query all active policies from on-chain
-            // 2. For each policy, check if liquidation condition is met
-            // 3. If yes, bundle addPostPriceUpdates + liquidate_policy
-            // 4. Send transaction
-            
-        } catch (error) {
-            console.error('❌ Error processing price update:', error);
-        }
+    // Find SOL/USD price feed ID
+    console.log('\n🔍 Finding SOL/USD price feed...');
+    const priceFeeds = await hermesClient.getPriceFeeds({
+        query: 'sol',
+        assetType: 'crypto',
     });
     
-    console.log('✅ Monitor running. Waiting for price updates...');
+    const solUsdFeed = priceFeeds.find((feed: any) => 
+        feed.symbol?.toLowerCase().includes('sol') && 
+        feed.symbol?.toLowerCase().includes('usd')
+    );
+    
+    // Remove 0x prefix if present
+    const foundFeedId = solUsdFeed?.id?.startsWith('0x') 
+        ? solUsdFeed.id.slice(2) 
+        : solUsdFeed?.id;
+    const SOL_FEED_ID = foundFeedId || FALLBACK_SOL_FEED_ID;
+    
+    if (!solUsdFeed || !solUsdFeed.id) {
+        console.log('⚠️  Could not find SOL/USD price feed, using fallback ID');
+    } else {
+        console.log(`✅ Found SOL/USD feed: ${solUsdFeed.symbol || 'N/A'}`);
+    }
+    
+    console.log(`📡 Subscribing to SOL/USD feed: ${SOL_FEED_ID}\n`);
+    
+    try {
+        // Get streaming price updates using EventSource
+        const eventSource = await hermesClient.getPriceUpdatesStream(
+            [SOL_FEED_ID],
+            { parsed: true } // Request parsed price updates
+        );
+        
+        eventSource.onmessage = (event: MessageEvent) => {
+            try {
+                const data = JSON.parse(event.data);
+                
+                // Parse price from data.parsed[0].price structure
+                let currentPrice: number | null = null;
+                let exponent = -8;
+                
+                if (Array.isArray(data.parsed) && data.parsed.length > 0) {
+                    const priceFeed = data.parsed[0];
+                    if (priceFeed.price) {
+                        const priceObj = priceFeed.price;
+                        currentPrice = Number(priceObj.price) * Math.pow(10, priceObj.expo || priceObj.exponent || -8);
+                        exponent = priceObj.expo || priceObj.exponent || -8;
+                    }
+                }
+                
+                if (currentPrice !== null) {
+                    const timestamp = Date.now();
+                    
+                    // Log price update
+                    console.log(`📈 SOL/USD Price: $${currentPrice.toFixed(2)}`);
+                    console.log(`   Timestamp: ${new Date(timestamp).toISOString()}`);
+                    
+                    // Check liquidation condition if configured
+                    if (LIQUIDATION_PRICE > 0) {
+                        const conditionMet = checkLiquidationCondition(
+                            currentPrice,
+                            LIQUIDATION_PRICE,
+                            OPTION_TYPE
+                        );
+                        
+                        console.log(`   Liquidation Price: $${LIQUIDATION_PRICE.toFixed(2)}`);
+                        console.log(`   Condition Met? ${conditionMet ? '✅ YES' : '❌ NO'}`);
+                        
+                        if (conditionMet) {
+                            console.log(`\n🔥 LIQUIDATION TRIGGERED!`);
+                            console.log(`   Current Price: $${currentPrice.toFixed(2)}`);
+                            console.log(`   Liquidation Price: $${LIQUIDATION_PRICE.toFixed(2)}`);
+                            console.log(`   Option Type: ${OPTION_TYPE.toUpperCase()}`);
+                            console.log(`   Calling /resolve endpoint...\n`);
+                            
+                            callResolveEndpoint(currentPrice, LIQUIDATION_PRICE, OPTION_TYPE);
+                        }
+                    }
+                    
+                    // Demo mode triggers (for testing)
+                    if (DEMO_MODE === 'CRASH') {
+                        const conditionMet = currentPrice < CRASH_TRIGGER_PRICE;
+                        console.log(`   Demo Trigger: $${CRASH_TRIGGER_PRICE.toLocaleString()}`);
+                        console.log(`   Demo Condition Met? ${conditionMet ? '✅ TRUE' : '❌ FALSE'}`);
+                    } else if (DEMO_MODE === 'PUMP') {
+                        const conditionMet = currentPrice > PUMP_TRIGGER_PRICE;
+                        console.log(`   Demo Trigger: $${PUMP_TRIGGER_PRICE.toLocaleString()}`);
+                        console.log(`   Demo Condition Met? ${conditionMet ? '✅ TRUE' : '❌ FALSE'}`);
+                    }
+                    
+                    console.log(''); // Empty line for readability
+                }
+            } catch (error) {
+                console.error('❌ Error processing price update:', error);
+            }
+        };
+        
+        eventSource.onerror = (error: Event) => {
+            console.error('❌ EventSource error:', error);
+        };
+        
+        console.log('✅ Monitor running. Waiting for price updates...\n');
+    } catch (error) {
+        console.error('💥 Error setting up stream:', error);
+        throw error;
+    }
 }
 
 // Run monitor

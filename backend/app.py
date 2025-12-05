@@ -1,9 +1,20 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import math
+import threading
+import requests
+import json
+import time
+from datetime import datetime
+from typing import Dict, List, Optional
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend communication
+
+# Global state for price monitoring
+current_sol_price: Optional[float] = None
+price_lock = threading.Lock()
+active_policies: List[Dict] = []  # List of active insurance policies to monitor
 
 def normal_cdf(x: float) -> float:
     """Standard normal CDF using the error function (no scipy needed)."""
@@ -246,6 +257,22 @@ def calculate_risk():
             days_to_expiration=days_to_expiration
         )
         
+        # Optionally register policy for monitoring if requested
+        register_for_monitoring = data.get('registerForMonitoring', False)
+        if register_for_monitoring and liquidation_price > 0:
+            policy_id = f"policy_{int(time.time())}"
+            policy = {
+                'id': policy_id,
+                'liquidationPrice': liquidation_price,
+                'optionType': option_type,
+                'insuranceAmount': insurance_amount,
+                'expirationDate': expiration_date,
+                'createdAt': datetime.now().isoformat()
+            }
+            with price_lock:
+                active_policies.append(policy)
+            print(f"✅ Registered policy {policy_id} for monitoring (Liquidation: ${liquidation_price}, Type: {option_type})")
+        
         return jsonify({
             'premium': premium,
             'optionPrice': round(option_price, 4),  # The calculated option price
@@ -265,8 +292,241 @@ def calculate_risk():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy'}), 200
+    with price_lock:
+        return jsonify({
+            'status': 'healthy',
+            'currentSolPrice': current_sol_price,
+            'activePolicies': len(active_policies)
+        }), 200
+
+@app.route('/resolve', methods=['POST'])
+def resolve():
+    """
+    Endpoint called when liquidation condition is met
+    This will be called by the price monitor when SOL price crosses liquidation threshold
+    """
+    try:
+        data = request.get_json()
+        current_price = data.get('currentPrice')
+        liquidation_price = data.get('liquidationPrice')
+        option_type = data.get('optionType', 'put')
+        timestamp = data.get('timestamp')
+        
+        print(f"\n🔥 LIQUIDATION RESOLVED!")
+        print(f"   Current Price: ${current_price}")
+        print(f"   Liquidation Price: ${liquidation_price}")
+        print(f"   Option Type: {option_type}")
+        print(f"   Timestamp: {timestamp}\n")
+        
+        # TODO: Implement actual liquidation logic here
+        # - Transfer insurance payout to user
+        # - Update policy status
+        # - Log transaction
+        
+        return jsonify({
+            'status': 'resolved',
+            'message': 'Liquidation condition met and resolved',
+            'currentPrice': current_price,
+            'liquidationPrice': liquidation_price,
+            'optionType': option_type
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Error resolving liquidation: {str(e)}'}), 500
+
+@app.route('/current-price', methods=['GET'])
+def get_current_price():
+    """Get current SOL price from websocket monitor"""
+    with price_lock:
+        if current_sol_price is None:
+            return jsonify({'error': 'Price not available yet'}), 503
+        return jsonify({'price': current_sol_price}), 200
+
+@app.route('/register-policy', methods=['POST'])
+def register_policy():
+    """Register an insurance policy for liquidation monitoring"""
+    try:
+        data = request.get_json()
+        
+        liquidation_price = float(data.get('liquidationPrice', 0))
+        option_type = data.get('optionType', 'put')
+        insurance_amount = float(data.get('insuranceAmount', 0))
+        expiration_date = data.get('expirationDate', None)
+        
+        if liquidation_price <= 0:
+            return jsonify({'error': 'Liquidation price must be greater than 0'}), 400
+        
+        policy_id = f"policy_{int(time.time())}"
+        policy = {
+            'id': policy_id,
+            'liquidationPrice': liquidation_price,
+            'optionType': option_type,
+            'insuranceAmount': insurance_amount,
+            'expirationDate': expiration_date,
+            'createdAt': datetime.now().isoformat()
+        }
+        
+        with price_lock:
+            active_policies.append(policy)
+        
+        print(f"✅ Registered policy {policy_id} for monitoring")
+        print(f"   Liquidation Price: ${liquidation_price}")
+        print(f"   Option Type: {option_type}")
+        print(f"   Insurance Amount: ${insurance_amount}")
+        
+        return jsonify({
+            'status': 'registered',
+            'policyId': policy_id,
+            'message': 'Policy registered for monitoring'
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Error registering policy: {str(e)}'}), 500
+
+@app.route('/active-policies', methods=['GET'])
+def get_active_policies():
+    """Get list of active policies being monitored"""
+    with price_lock:
+        return jsonify({
+            'policies': active_policies,
+            'count': len(active_policies)
+        }), 200
+
+def check_liquidation_condition(current_price: float, liquidation_price: float, option_type: str) -> bool:
+    """Check if liquidation condition is met"""
+    if liquidation_price <= 0:
+        return False
+    
+    if option_type.lower() == 'call':
+        # Call option: liquidate if price goes ABOVE liquidation price
+        return current_price > liquidation_price
+    elif option_type.lower() == 'put':
+        # Put option: liquidate if price goes BELOW liquidation price
+        return current_price < liquidation_price
+    
+    return False
+
+def call_resolve_endpoint(current_price: float, liquidation_price: float, option_type: str):
+    """Call /resolve endpoint when liquidation condition is met"""
+    try:
+        url = f'http://localhost:5000/resolve'
+        payload = {
+            'currentPrice': current_price,
+            'liquidationPrice': liquidation_price,
+            'optionType': option_type,
+            'timestamp': datetime.now().isoformat()
+        }
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            print(f"✅ Successfully called /resolve endpoint")
+        else:
+            print(f"⚠️  /resolve endpoint returned status {response.status_code}")
+    except Exception as e:
+        print(f"❌ Error calling /resolve endpoint: {e}")
+
+def monitor_sol_price():
+    """Background thread to monitor SOL price from Pyth Network"""
+    global current_sol_price, active_policies
+    
+    # SOL/USD Feed ID (Pyth Network) - without 0x prefix
+    SOL_FEED_ID = 'ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d'
+    HERMES_URL = 'https://hermes.pyth.network'
+    
+    print("🚀 Starting SOL price monitor...")
+    print(f"   Monitoring SOL/USD feed: {SOL_FEED_ID}")
+    
+    while True:
+        try:
+            # Get latest price updates from Pyth Hermes API
+            # Using the same endpoint format as the Hermes client
+            url = f"{HERMES_URL}/api/latest_price_feeds"
+            params = {
+                'ids[]': SOL_FEED_ID,
+                'parsed': 'true'
+            }
+            
+            response = requests.get(url, params=params, timeout=10, headers={
+                'Accept': 'application/json'
+            })
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Parse price from response
+                # The Hermes API returns data in format: {"parsed": [{"id": "...", "price": {...}}]}
+                price_value = None
+                exponent = -8
+                
+                if isinstance(data, dict) and 'parsed' in data:
+                    parsed_data = data['parsed']
+                    if isinstance(parsed_data, list) and len(parsed_data) > 0:
+                        price_feed = parsed_data[0]
+                        if 'price' in price_feed and price_feed['price']:
+                            price_obj = price_feed['price']
+                            price_value = price_obj.get('price')
+                            exponent = price_obj.get('expo', -8)
+                elif isinstance(data, list) and len(data) > 0:
+                    # Fallback: direct array format
+                    price_feed = data[0]
+                    if 'price' in price_feed and price_feed['price']:
+                        price_obj = price_feed['price']
+                        price_value = price_obj.get('price')
+                        exponent = price_obj.get('expo', -8)
+                
+                if price_value is not None:
+                    # Normalize price
+                    normalized_price = float(price_value) * (10 ** exponent)
+                    
+                    with price_lock:
+                        current_sol_price = normalized_price
+                    
+                    print(f"💰 SOL/USD Price: ${normalized_price:.2f} (Updated: {datetime.now().strftime('%H:%M:%S')})")
+                    
+                    # Check liquidation conditions for all active policies
+                    with price_lock:
+                        policies_to_check = active_policies.copy()
+                    
+                    for policy in policies_to_check:
+                        liquidation_price = policy.get('liquidationPrice')
+                        option_type = policy.get('optionType', 'put')
+                        
+                        if check_liquidation_condition(normalized_price, liquidation_price, option_type):
+                            print(f"\n🔥 LIQUIDATION TRIGGERED!")
+                            print(f"   Policy: {policy.get('id', 'unknown')}")
+                            print(f"   Current Price: ${normalized_price:.2f}")
+                            print(f"   Liquidation Price: ${liquidation_price:.2f}")
+                            print(f"   Option Type: {option_type}\n")
+                            
+                            call_resolve_endpoint(normalized_price, liquidation_price, option_type)
+                            
+                            # Remove resolved policy (or mark as resolved)
+                            with price_lock:
+                                active_policies = [p for p in active_policies if p.get('id') != policy.get('id')]
+                else:
+                    print(f"⚠️  Could not parse price from API response")
+                    if isinstance(data, dict):
+                        print(f"   Response keys: {list(data.keys())}")
+            
+            # Poll every 5 seconds
+            time.sleep(5)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Network error in price monitor: {e}")
+            time.sleep(10)  # Wait longer on error
+        except Exception as e:
+            print(f"❌ Error in price monitor: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(10)  # Wait longer on error
+
+def start_price_monitor():
+    """Start the price monitoring thread"""
+    monitor_thread = threading.Thread(target=monitor_sol_price, daemon=True)
+    monitor_thread.start()
+    print("✅ Price monitor thread started")
 
 if __name__ == '__main__':
+    # Start price monitoring in background thread
+    start_price_monitor()
     app.run(debug=True, port=5000)
 
