@@ -1,0 +1,26 @@
+{
+  "name": "liqguard-monitor",
+  "version": "1.0.0",
+  "description": "LiqGuard liquidation monitor for Solana",
+  "type": "module",
+  "main": "monitor.ts",
+  "scripts": {
+    "monitor": "tsx monitor.ts",
+    "build": "tsc",
+    "dev": "tsx watch monitor.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.0",
+    "@pythnetwork/hermes-client": "^2.0.0",
+    "@pythnetwork/pyth-solana-receiver": "^1.0.0",
+    "@solana/web3.js": "^1.87.6",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
+

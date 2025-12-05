@@ -1,0 +1,21 @@
+[package]
+name = "liqguard"
+version = "0.1.0"
+description = "Decentralized perpetual insurance app on Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "liqguard"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.30.0"
+pyth-solana-receiver-sdk = "0.1.0"
+
