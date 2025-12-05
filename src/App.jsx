@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { ethers } from 'ethers'
 
 function App() {
   const [formData, setFormData] = useState({
@@ -18,6 +19,194 @@ function App() {
   const [policyRegistered, setPolicyRegistered] = useState(false)
   const [currentSolPrice, setCurrentSolPrice] = useState(null)
   const [priceLoading, setPriceLoading] = useState(true)
+  const [provider, setProvider] = useState(null)
+  const [signer, setSigner] = useState(null)
+  const [account, setAccount] = useState(null)
+  const [connected, setConnected] = useState(false)
+  const [premiumPaid, setPremiumPaid] = useState(false)
+  const [payingPremium, setPayingPremium] = useState(false)
+  const [backendWalletAddress, setBackendWalletAddress] = useState(null)
+  const [ethPrice, setEthPrice] = useState(null)
+
+  // Connect MetaMask wallet
+  const connectWallet = async () => {
+    if (typeof window.ethereum !== 'undefined') {
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum)
+        const accounts = await provider.send('eth_requestAccounts', [])
+        const signer = await provider.getSigner()
+        
+        setProvider(provider)
+        setSigner(signer)
+        setAccount(accounts[0])
+        setConnected(true)
+      } catch (error) {
+        console.error('Error connecting wallet:', error)
+        setError('Failed to connect wallet')
+      }
+    } else {
+      setError('MetaMask is not installed. Please install MetaMask to continue.')
+    }
+  }
+
+  // Disconnect wallet
+  const disconnectWallet = () => {
+    setProvider(null)
+    setSigner(null)
+    setAccount(null)
+    setConnected(false)
+    setPremiumPaid(false)
+  }
+
+  // Pay premium with ETH
+  const payPremium = async () => {
+    if (!signer || !calculatedPremium) {
+      setError('Please connect wallet and calculate premium first')
+      return
+    }
+
+    setPayingPremium(true)
+    setError(null)
+
+    try {
+      // Premium is in USD, convert to ETH using current ETH price
+      if (!ethPrice) {
+        throw new Error('ETH price not available. Please wait a moment and try again.')
+      }
+      
+      const premiumInUSD = parseFloat(calculatedPremium.toString())
+      const premiumInEth = premiumInUSD / ethPrice
+      
+      console.log('💰 Premium conversion:', {
+        premiumUSD: premiumInUSD.toFixed(2) + ' USD',
+        ethPrice: ethPrice + ' USD',
+        premiumETH: premiumInEth.toFixed(6) + ' ETH'
+      })
+      
+      const premiumAmount = ethers.parseEther(premiumInEth.toFixed(18))
+      
+      // Get backend wallet address from backend API (no need for frontend env variable)
+      if (!backendWalletAddress) {
+        throw new Error(
+          'Backend wallet address not available.\n\n' +
+          'Please make sure your backend server is running and the wallet is initialized.\n' +
+          'Check backend logs for: "✅ Sender wallet initialized: 0x..."'
+        )
+      }
+      
+      // Normalize address using getAddress to ensure proper checksum format
+      const backendAddress = ethers.getAddress(backendWalletAddress)
+      
+      // Check if user is trying to send to their own address (warn but allow for testing)
+      if (account && account.toLowerCase() === backendAddress.toLowerCase()) {
+        console.warn('⚠️ Warning: Sending to your own wallet address')
+        console.warn('   Your wallet:', account)
+        console.warn('   Backend wallet:', backendAddress)
+        console.warn('   Note: For production, use different wallets. This is allowed for testing.')
+        // Allow it for testing purposes - just log a warning
+      }
+      
+      // Check balance before sending
+      const balance = await provider.getBalance(account)
+      const balanceInEth = parseFloat(ethers.formatEther(balance))
+      
+      console.log('💰 Balance check:', {
+        yourBalance: balanceInEth.toFixed(6) + ' ETH',
+        premiumAmount: premiumInEth.toFixed(6) + ' ETH',
+        premiumUSD: premiumInUSD.toFixed(2) + ' USD',
+        sufficient: balance >= premiumAmount
+      })
+      
+      if (balance < premiumAmount) {
+        const shortfall = premiumInEth - balanceInEth
+        throw new Error(
+          `❌ Insufficient funds!\n\n` +
+          `You have: ${balanceInEth.toFixed(6)} ETH\n` +
+          `Premium requires: ${premiumInEth.toFixed(6)} ETH ($${premiumInUSD.toFixed(2)})\n` +
+          `Need: ${shortfall.toFixed(6)} ETH more\n\n` +
+          `Get testnet ETH from a faucet:\n` +
+          `- Base Sepolia: https://www.coinbase.com/faucets/base-ethereum-goerli-faucet`
+        )
+      }
+      
+      console.log('Sending to backend address:', backendAddress)
+      console.log('Amount:', premiumInEth.toFixed(6), 'ETH', `($${premiumInUSD.toFixed(2)} USD)`)
+      
+      // Get network info
+      const network = await provider.getNetwork()
+      console.log('Current network chainId:', network.chainId.toString())
+      console.log('Network name:', network.name)
+      
+      // Send transaction with explicit parameters
+      const tx = await signer.sendTransaction({
+        to: backendAddress,
+        value: premiumAmount,
+      })
+
+      console.log('Transaction sent:', tx.hash)
+      const receipt = await tx.wait()
+      console.log('Transaction confirmed:', receipt)
+
+      // Notify backend of payment
+      const response = await fetch('http://localhost:5000/pay-premium', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          userWalletAddress: account,
+          premiumAmount: calculatedPremium,
+          transactionSignature: tx.hash,
+        }),
+      })
+
+      if (response.ok) {
+        setPremiumPaid(true)
+        await registerPolicy()
+      } else {
+        const errorData = await response.json()
+        throw new Error(errorData.error || 'Failed to confirm payment')
+      }
+    } catch (err) {
+      console.error('Error paying premium:', err)
+      setError(err.message || 'Failed to pay premium')
+    } finally {
+      setPayingPremium(false)
+    }
+  }
+
+  // Register policy after premium is paid
+  const registerPolicy = async () => {
+    if (!account || !premiumPaid) return
+
+    try {
+      const liquidationPrice = parseFloat(formData.liquidationPrice) || 0
+      if (liquidationPrice <= 0) return
+
+      const response = await fetch('http://localhost:5000/register-policy', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          liquidationPrice: liquidationPrice,
+          optionType: formData.optionType,
+          insuranceAmount: parseFloat(formData.insuranceAmount) || 0,
+          expirationDate: formData.expirationDate || null,
+          userWalletAddress: account,
+          premiumPaid: true,
+        }),
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        setPolicyRegistered(true)
+        console.log('✅ Policy registered:', result.policyId)
+      }
+    } catch (err) {
+      console.error('Failed to register policy:', err)
+    }
+  }
 
   // Fetch current SOL price from backend
   useEffect(() => {
@@ -65,6 +254,79 @@ function App() {
 
     return () => clearInterval(interval)
   }, [])
+
+  // Fetch backend wallet address from backend
+  useEffect(() => {
+    const fetchBackendWallet = async () => {
+      try {
+        const response = await fetch('http://localhost:5000/backend-wallet-address')
+        if (response.ok) {
+          const data = await response.json()
+          setBackendWalletAddress(data.address)
+          console.log('✅ Backend wallet address fetched:', data.address)
+        } else {
+          const errorData = await response.json()
+          console.error('Failed to fetch backend wallet address:', errorData.error)
+          setError('Backend wallet not initialized. Make sure backend server is running and SENDER_WALLET_PRIVATE_KEY is set.')
+        }
+      } catch (err) {
+        console.error('Error fetching backend wallet address:', err)
+        setError('Cannot connect to backend server. Make sure it\'s running on http://localhost:5000')
+      }
+    }
+    
+    fetchBackendWallet()
+  }, [])
+
+  // Fetch current ETH price in USD from backend (Pyth Network)
+  useEffect(() => {
+    const fetchEthPrice = async () => {
+      try {
+        const response = await fetch('http://localhost:5000/eth-price')
+        if (response.ok) {
+          const data = await response.json()
+          const price = data.price
+          if (price) {
+            setEthPrice(price)
+            console.log('✅ ETH price fetched:', price)
+          }
+        } else {
+          console.warn('ETH price not available yet from backend')
+        }
+      } catch (err) {
+        console.error('Error fetching ETH price:', err)
+      }
+    }
+    
+    // Fetch immediately
+    fetchEthPrice()
+    // Refresh ETH price every 5 seconds (same as SOL price)
+    const interval = setInterval(fetchEthPrice, 5000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Auto-calculate premium when form data changes
+  useEffect(() => {
+    const insurance = parseFloat(formData.insuranceAmount) || 0
+    const assetPrice = parseFloat(formData.currentAssetPrice) || 0
+    
+    // Only auto-calculate if we have the minimum required fields
+    if (insurance > 0 && assetPrice > 0) {
+      // Debounce the calculation to avoid too many API calls
+      const timeoutId = setTimeout(() => {
+        calculatePremium(formData)
+      }, 800) // Wait 800ms after user stops typing
+      
+      return () => clearTimeout(timeoutId)
+    } else {
+      // Reset premium if required fields are missing
+      setCalculatedPremium(null)
+      setPremiumData(null)
+      setPremiumPaid(false)
+      setPolicyRegistered(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [formData.insuranceAmount, formData.currentAssetPrice, formData.liquidationPrice, formData.optionType, formData.expirationDate])
 
   const handleInputChange = (e) => {
     const { name, value } = e.target
@@ -136,33 +398,8 @@ function App() {
       setCalculatedPremium(result.premium.toFixed(4))
       setPremiumData(result)
       
-      // Automatically register policy for monitoring if liquidation price is provided
-      const liquidationPrice = parseFloat(data.liquidationPrice) || 0
-      if (liquidationPrice > 0) {
-        try {
-          const registerResponse = await fetch('http://localhost:5000/register-policy', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              liquidationPrice: liquidationPrice,
-              optionType: data.optionType,
-              insuranceAmount: insurance,
-              expirationDate: data.expirationDate || null,
-            }),
-          })
-          
-          if (registerResponse.ok) {
-            const registerResult = await registerResponse.json()
-            setPolicyRegistered(true)
-            console.log('✅ Policy registered for monitoring:', registerResult.policyId)
-          }
-        } catch (registerErr) {
-          console.error('Failed to register policy for monitoring:', registerErr)
-          // Don't show error to user, just log it
-        }
-      }
+      // Reset premium paid status when recalculating
+      setPremiumPaid(false)
     } catch (err) {
       setError(err.message)
       setCalculatedPremium(null)
@@ -186,6 +423,42 @@ function App() {
   return (
     <div className="min-h-screen bg-[#0a0e27] text-white">
       <div className="max-w-6xl mx-auto px-4 py-8">
+        {/* Wallet Connection - Prominent Header */}
+        <div className="mb-6 bg-[#131829] border border-gray-800 rounded-xl p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-lg font-semibold mb-1">Connect Your Wallet</h2>
+              <p className="text-sm text-gray-400">Connect your MetaMask wallet to purchase insurance</p>
+            </div>
+            {!connected ? (
+              <button
+                onClick={connectWallet}
+                className="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold transition-colors flex items-center gap-2"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
+                Connect Wallet
+              </button>
+            ) : (
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/30 rounded-lg">
+                  <div className="w-2 h-2 bg-green-400 rounded-full"></div>
+                  <span className="text-sm font-medium text-green-400">
+                    {account ? `${account.slice(0, 6)}...${account.slice(-4)}` : 'Connected'}
+                  </span>
+                </div>
+                <button
+                  onClick={disconnectWallet}
+                  className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors"
+                >
+                  Disconnect
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* Main Transaction Panel */}
         <div className="bg-[#131829] rounded-xl p-6 mb-6 border border-gray-800">
           {/* Badge */}
@@ -380,14 +653,98 @@ function App() {
               </div>
             )}
 
-            {/* Submit Button */}
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full bg-green-500 hover:bg-green-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-4 rounded-lg transition-colors"
-            >
-              {loading ? 'Calculating...' : 'Calculate Insurance Premium'}
-            </button>
+            {/* Premium Display and Payment Section */}
+            {calculatedPremium && premiumData && (
+              <div className="space-y-4">
+                {/* Pay Premium Button - Prominent */}
+                {!premiumPaid && (
+                  <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+                    {!connected ? (
+                      <div className="text-center">
+                        <p className="text-blue-400 text-sm font-semibold mb-2">Connect your wallet to purchase insurance</p>
+                        <button
+                          type="button"
+                          onClick={connectWallet}
+                          className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-lg transition-colors"
+                        >
+                          Connect Wallet & Pay Premium
+                        </button>
+                      </div>
+                    ) : (
+                      <div>
+                        <div className="flex items-center justify-between mb-3">
+                          <div>
+                            <p className="text-blue-400 text-sm font-semibold">Ready to Purchase</p>
+                            <p className="text-gray-400 text-xs mt-1">
+                              Premium: {ethPrice ? (parseFloat(calculatedPremium) / ethPrice).toFixed(6) + ' ETH' : 'Calculating...'}
+                            </p>
+                          </div>
+                          <div className="text-right">
+                            <p className="text-white text-lg font-bold">${calculatedPremium}</p>
+                            <p className="text-gray-400 text-xs">Coverage: ${formatUSD(formData.insuranceAmount)}</p>
+                            {ethPrice && (
+                              <p className="text-gray-500 text-xs mt-1">
+                                ETH Price: ${ethPrice.toFixed(2)}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={payPremium}
+                          disabled={payingPremium}
+                          className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-4 rounded-lg transition-colors flex items-center justify-center gap-2"
+                        >
+                          {payingPremium ? (
+                            <>
+                              <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                              </svg>
+                              Processing Payment...
+                            </>
+                          ) : (
+                            <>
+                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                              </svg>
+                              Pay Premium & Take Position
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Premium Paid Status */}
+                {premiumPaid && (
+                  <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-lg">
+                    <div className="flex items-center gap-3">
+                      <svg className="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <div>
+                        <p className="text-green-400 text-sm font-semibold">✅ Premium Paid Successfully</p>
+                        <p className="text-gray-400 text-xs mt-1">Your policy is now active and being monitored for liquidation conditions</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Manual Calculate Button (Optional - for manual refresh) */}
+            {calculatedPremium && (
+              <button
+                type="button"
+                onClick={() => calculatePremium()}
+                disabled={loading}
+                className="w-full bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm py-2 rounded-lg transition-colors"
+              >
+                {loading ? 'Recalculating...' : 'Refresh Premium'}
+              </button>
+            )}
           </form>
         </div>
 

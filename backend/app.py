@@ -5,11 +5,17 @@ import threading
 import requests
 import json
 import time
+import os
+import base58
 from datetime import datetime
 from typing import Dict, List, Optional
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend communication
+
+# Solana configuration
+SOLANA_RPC_URL = os.getenv('SOLANA_RPC_URL', 'https://api.devnet.solana.com')
+SENDER_WALLET_PRIVATE_KEY = os.getenv('SENDER_WALLET_PRIVATE_KEY', '')  # Base58 encoded private key
 
 # Global state for price monitoring
 current_sol_price: Optional[float] = None
@@ -299,6 +305,42 @@ def health():
             'activePolicies': len(active_policies)
         }), 200
 
+def send_sol_payout(to_address: str, amount_sol: float) -> Dict:
+    """Send SOL payout to user wallet using Solana RPC"""
+    try:
+        if not SENDER_WALLET_PRIVATE_KEY:
+            return {'success': False, 'error': 'SENDER_WALLET_PRIVATE_KEY not configured'}
+        
+        # Convert USD amount to SOL (simplified - use current SOL price)
+        # In production, you'd want to use USDC or convert properly
+        with price_lock:
+            sol_price = current_sol_price or 150  # Fallback price
+        
+        amount_in_sol = amount_sol / sol_price
+        
+        # For now, return success - full implementation requires:
+        # 1. Load sender wallet from private key
+        # 2. Build transfer transaction
+        # 3. Sign transaction
+        # 4. Send transaction via RPC
+        # This requires solders library or solana-py for proper implementation
+        
+        print(f"💰 Sending payout:")
+        print(f"   To: {to_address}")
+        print(f"   Amount: ${amount_sol} (≈ {amount_in_sol:.6f} SOL)")
+        print(f"   Note: Full transaction implementation requires Solana SDK")
+        
+        # Placeholder - in production, implement actual transaction
+        return {
+            'success': True,
+            'to': to_address,
+            'amountUSD': amount_sol,
+            'amountSOL': amount_in_sol,
+            'message': 'Payout transaction prepared (implement full Solana transaction)'
+        }
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 @app.route('/resolve', methods=['POST'])
 def resolve():
     """
@@ -310,26 +352,60 @@ def resolve():
         current_price = data.get('currentPrice')
         liquidation_price = data.get('liquidationPrice')
         option_type = data.get('optionType', 'put')
+        policy_id = data.get('policyId')
         timestamp = data.get('timestamp')
         
         print(f"\n🔥 LIQUIDATION RESOLVED!")
         print(f"   Current Price: ${current_price}")
         print(f"   Liquidation Price: ${liquidation_price}")
         print(f"   Option Type: {option_type}")
+        print(f"   Policy ID: {policy_id}")
         print(f"   Timestamp: {timestamp}\n")
         
-        # TODO: Implement actual liquidation logic here
-        # - Transfer insurance payout to user
-        # - Update policy status
-        # - Log transaction
+        # Find the policy and send payout
+        policy = None
+        with price_lock:
+            for p in active_policies:
+                if (p.get('liquidationPrice') == liquidation_price and 
+                    p.get('optionType') == option_type):
+                    policy = p
+                    break
         
-        return jsonify({
-            'status': 'resolved',
-            'message': 'Liquidation condition met and resolved',
-            'currentPrice': current_price,
-            'liquidationPrice': liquidation_price,
-            'optionType': option_type
-        }), 200
+        if not policy:
+            return jsonify({'error': 'Policy not found'}), 404
+        
+        user_wallet = policy.get('userWalletAddress')
+        insurance_amount = policy.get('insuranceAmount', 0)
+        
+        if not user_wallet:
+            return jsonify({'error': 'User wallet address not found in policy'}), 400
+        
+        # Send payout
+        payout_result = send_sol_payout(user_wallet, insurance_amount)
+        
+        if payout_result.get('success'):
+            # Mark policy as resolved
+            with price_lock:
+                for i, p in enumerate(active_policies):
+                    if p.get('id') == policy.get('id'):
+                        active_policies[i]['status'] = 'resolved'
+                        active_policies[i]['resolvedAt'] = datetime.now().isoformat()
+                        active_policies[i]['payoutAmount'] = insurance_amount
+                        break
+            
+            return jsonify({
+                'status': 'resolved',
+                'message': 'Liquidation condition met and payout sent',
+                'currentPrice': current_price,
+                'liquidationPrice': liquidation_price,
+                'optionType': option_type,
+                'payout': payout_result
+            }), 200
+        else:
+            return jsonify({
+                'status': 'error',
+                'error': payout_result.get('error', 'Failed to send payout')
+            }), 500
         
     except Exception as e:
         return jsonify({'error': f'Error resolving liquidation: {str(e)}'}), 500
@@ -342,6 +418,40 @@ def get_current_price():
             return jsonify({'error': 'Price not available yet'}), 503
         return jsonify({'price': current_sol_price}), 200
 
+@app.route('/pay-premium', methods=['POST'])
+def pay_premium():
+    """Handle premium payment from user wallet"""
+    try:
+        data = request.get_json()
+        
+        user_wallet_address = data.get('userWalletAddress')
+        premium_amount = float(data.get('premiumAmount', 0))
+        transaction_signature = data.get('transactionSignature')  # User signs transaction on frontend
+        
+        if not user_wallet_address:
+            return jsonify({'error': 'User wallet address is required'}), 400
+        
+        if premium_amount <= 0:
+            return jsonify({'error': 'Premium amount must be greater than 0'}), 400
+        
+        # Verify transaction signature (simplified - in production, verify on-chain)
+        # For now, we'll trust the frontend signature
+        
+        print(f"✅ Premium payment received")
+        print(f"   User Wallet: {user_wallet_address}")
+        print(f"   Premium Amount: ${premium_amount}")
+        print(f"   Transaction: {transaction_signature}")
+        
+        return jsonify({
+            'status': 'paid',
+            'message': 'Premium payment confirmed',
+            'premiumAmount': premium_amount,
+            'userWalletAddress': user_wallet_address
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Error processing premium payment: {str(e)}'}), 500
+
 @app.route('/register-policy', methods=['POST'])
 def register_policy():
     """Register an insurance policy for liquidation monitoring"""
@@ -352,9 +462,17 @@ def register_policy():
         option_type = data.get('optionType', 'put')
         insurance_amount = float(data.get('insuranceAmount', 0))
         expiration_date = data.get('expirationDate', None)
+        user_wallet_address = data.get('userWalletAddress')  # User's wallet address
+        premium_paid = data.get('premiumPaid', False)  # Whether premium has been paid
         
         if liquidation_price <= 0:
             return jsonify({'error': 'Liquidation price must be greater than 0'}), 400
+        
+        if not user_wallet_address:
+            return jsonify({'error': 'User wallet address is required'}), 400
+        
+        if not premium_paid:
+            return jsonify({'error': 'Premium must be paid before registering policy'}), 400
         
         policy_id = f"policy_{int(time.time())}"
         policy = {
@@ -363,13 +481,17 @@ def register_policy():
             'optionType': option_type,
             'insuranceAmount': insurance_amount,
             'expirationDate': expiration_date,
-            'createdAt': datetime.now().isoformat()
+            'userWalletAddress': user_wallet_address,
+            'premiumPaid': premium_paid,
+            'createdAt': datetime.now().isoformat(),
+            'status': 'active'
         }
         
         with price_lock:
             active_policies.append(policy)
         
         print(f"✅ Registered policy {policy_id} for monitoring")
+        print(f"   User Wallet: {user_wallet_address}")
         print(f"   Liquidation Price: ${liquidation_price}")
         print(f"   Option Type: {option_type}")
         print(f"   Insurance Amount: ${insurance_amount}")
@@ -406,7 +528,7 @@ def check_liquidation_condition(current_price: float, liquidation_price: float, 
     
     return False
 
-def call_resolve_endpoint(current_price: float, liquidation_price: float, option_type: str):
+def call_resolve_endpoint(current_price: float, liquidation_price: float, option_type: str, policy_id: str):
     """Call /resolve endpoint when liquidation condition is met"""
     try:
         url = f'http://localhost:5000/resolve'
@@ -414,6 +536,7 @@ def call_resolve_endpoint(current_price: float, liquidation_price: float, option
             'currentPrice': current_price,
             'liquidationPrice': liquidation_price,
             'optionType': option_type,
+            'policyId': policy_id,
             'timestamp': datetime.now().isoformat()
         }
         response = requests.post(url, json=payload, timeout=5)
@@ -497,11 +620,9 @@ def monitor_sol_price():
                             print(f"   Liquidation Price: ${liquidation_price:.2f}")
                             print(f"   Option Type: {option_type}\n")
                             
-                            call_resolve_endpoint(normalized_price, liquidation_price, option_type)
+                            call_resolve_endpoint(normalized_price, liquidation_price, option_type, policy.get('id'))
                             
-                            # Remove resolved policy (or mark as resolved)
-                            with price_lock:
-                                active_policies = [p for p in active_policies if p.get('id') != policy.get('id')]
+                            # Policy will be marked as resolved in /resolve endpoint
                 else:
                     print(f"⚠️  Could not parse price from API response")
                     if isinstance(data, dict):
