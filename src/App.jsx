@@ -26,23 +26,77 @@ function App() {
   const [premiumPaid, setPremiumPaid] = useState(false)
   const [payingPremium, setPayingPremium] = useState(false)
   const [backendWalletAddress, setBackendWalletAddress] = useState(null)
-  const [ethPrice, setEthPrice] = useState(null)
 
-  // Connect MetaMask wallet
+  // Switch to Base mainnet if not already on it
+  const switchToBaseNetwork = async () => {
+    const BASE_MAINNET_CHAIN_ID = '0x2105' // 8453 in hex
+    const BASE_MAINNET_CONFIG = {
+      chainId: BASE_MAINNET_CHAIN_ID,
+      chainName: 'Base',
+      nativeCurrency: {
+        name: 'Ether',
+        symbol: 'ETH',
+        decimals: 18,
+      },
+      rpcUrls: ['https://mainnet.base.org'],
+      blockExplorerUrls: ['https://basescan.org'],
+    }
+
+    try {
+      // Try to switch to Base network
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: BASE_MAINNET_CHAIN_ID }],
+      })
+    } catch (switchError) {
+      // This error code indicates that the chain has not been added to MetaMask
+      if (switchError.code === 4902) {
+        try {
+          // Add Base network to MetaMask
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [BASE_MAINNET_CONFIG],
+          })
+        } catch (addError) {
+          console.error('Error adding Base network:', addError)
+          throw new Error('Failed to add Base network to MetaMask. Please add it manually.')
+        }
+      } else {
+        throw switchError
+      }
+    }
+  }
+
+  // Connect MetaMask wallet and ensure we're on Base network
   const connectWallet = async () => {
     if (typeof window.ethereum !== 'undefined') {
       try {
+        // First, switch to Base network
+        await switchToBaseNetwork()
+        
         const provider = new ethers.BrowserProvider(window.ethereum)
         const accounts = await provider.send('eth_requestAccounts', [])
         const signer = await provider.getSigner()
+        
+        // Verify we're on Base network
+        const network = await provider.getNetwork()
+        const BASE_MAINNET_CHAIN_ID = 8453n
+        if (network.chainId !== BASE_MAINNET_CHAIN_ID) {
+          throw new Error('Please switch to Base mainnet in MetaMask')
+        }
         
         setProvider(provider)
         setSigner(signer)
         setAccount(accounts[0])
         setConnected(true)
-      } catch (error) {
-        console.error('Error connecting wallet:', error)
-        setError('Failed to connect wallet')
+        setError(null) // Clear any previous errors
+      } catch (err) {
+        console.error('Error connecting wallet:', err)
+        if (err.message?.includes('switch') || err.message?.includes('network')) {
+          setError('Please approve the network switch in MetaMask and try again.')
+        } else {
+          setError('Failed to connect wallet. Please make sure MetaMask is installed and switch to Base mainnet.')
+        }
       }
     } else {
       setError('MetaMask is not installed. Please install MetaMask to continue.')
@@ -58,7 +112,7 @@ function App() {
     setPremiumPaid(false)
   }
 
-  // Pay premium with ETH
+  // Pay premium with USDC
   const payPremium = async () => {
     if (!signer || !calculatedPremium) {
       setError('Please connect wallet and calculate premium first')
@@ -69,23 +123,54 @@ function App() {
     setError(null)
 
     try {
-      // Premium is in USD, convert to ETH using current ETH price
-      if (!ethPrice) {
-        throw new Error('ETH price not available. Please wait a moment and try again.')
+      const premiumInUSD = parseFloat(calculatedPremium.toString())
+      
+      // Verify network is Base mainnet (chainId: 8453)
+      const network = await provider.getNetwork()
+      const BASE_MAINNET_CHAIN_ID = 8453n
+      if (network.chainId !== BASE_MAINNET_CHAIN_ID) {
+        // Try to switch networks automatically
+        try {
+          await switchToBaseNetwork()
+          // Wait a moment for network switch
+          await new Promise(resolve => setTimeout(resolve, 1000))
+          // Re-check network
+          const newNetwork = await provider.getNetwork()
+          if (newNetwork.chainId !== BASE_MAINNET_CHAIN_ID) {
+            throw new Error('Network switch failed')
+          }
+        } catch (switchErr) {
+          throw new Error(
+            `❌ Wrong network!\n\n` +
+            `You are connected to chain ID: ${network.chainId}\n` +
+            `Please switch to Base mainnet (chain ID: 8453)\n\n` +
+            `Click "Connect Wallet" again to automatically switch networks, or manually switch in MetaMask.`
+          )
+        }
       }
       
-      const premiumInUSD = parseFloat(calculatedPremium.toString())
-      const premiumInEth = premiumInUSD / ethPrice
+      // USDC contract address on Base mainnet
+      const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+      // USDC ABI (minimal - approve and transfer)
+      const USDC_ABI = [
+        'function transfer(address to, uint256 amount) returns (bool)',
+        'function approve(address spender, uint256 amount) returns (bool)',
+        'function balanceOf(address account) view returns (uint256)',
+        'function allowance(address owner, address spender) view returns (uint256)',
+        'function decimals() view returns (uint8)'
+      ]
       
-      console.log('💰 Premium conversion:', {
+      // Convert USD to USDC (USDC has 6 decimals)
+      const premiumAmount = ethers.parseUnits(premiumInUSD.toFixed(6), 6)
+      
+      console.log('💰 Premium payment:', {
         premiumUSD: premiumInUSD.toFixed(2) + ' USD',
-        ethPrice: ethPrice + ' USD',
-        premiumETH: premiumInEth.toFixed(6) + ' ETH'
+        premiumUSDC: ethers.formatUnits(premiumAmount, 6) + ' USDC',
+        network: network.name,
+        chainId: network.chainId.toString()
       })
       
-      const premiumAmount = ethers.parseEther(premiumInEth.toFixed(18))
-      
-      // Get backend wallet address from backend API (no need for frontend env variable)
+      // Get backend wallet address from backend API
       if (!backendWalletAddress) {
         throw new Error(
           'Backend wallet address not available.\n\n' +
@@ -103,44 +188,72 @@ function App() {
         console.warn('   Your wallet:', account)
         console.warn('   Backend wallet:', backendAddress)
         console.warn('   Note: For production, use different wallets. This is allowed for testing.')
-        // Allow it for testing purposes - just log a warning
       }
       
-      // Check balance before sending
-      const balance = await provider.getBalance(account)
-      const balanceInEth = parseFloat(ethers.formatEther(balance))
+      // Get USDC contract instance
+      const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, signer)
+      
+      // Verify contract exists by checking code
+      const code = await provider.getCode(USDC_ADDRESS)
+      if (code === '0x') {
+        throw new Error(
+          `❌ USDC contract not found at address ${USDC_ADDRESS}\n\n` +
+          `Make sure you are connected to Base mainnet (chain ID: 8453)\n` +
+          `Current network: ${network.name} (chain ID: ${network.chainId})`
+        )
+      }
+      
+      // Check USDC balance with error handling
+      let balance
+      try {
+        balance = await usdcContract.balanceOf(account)
+      } catch (err) {
+        console.error('Error calling balanceOf:', err)
+        throw new Error(
+          `❌ Failed to check USDC balance.\n\n` +
+          `Make sure:\n` +
+          `1. You are connected to Base mainnet (chain ID: 8453)\n` +
+          `2. The USDC contract exists at ${USDC_ADDRESS}\n\n` +
+          `Error: ${err.message}`
+        )
+      }
+      
+      const balanceInUSDC = parseFloat(ethers.formatUnits(balance, 6))
       
       console.log('💰 Balance check:', {
-        yourBalance: balanceInEth.toFixed(6) + ' ETH',
-        premiumAmount: premiumInEth.toFixed(6) + ' ETH',
-        premiumUSD: premiumInUSD.toFixed(2) + ' USD',
+        yourBalance: balanceInUSDC.toFixed(2) + ' USDC',
+        premiumAmount: premiumInUSD.toFixed(2) + ' USDC',
         sufficient: balance >= premiumAmount
       })
       
       if (balance < premiumAmount) {
-        const shortfall = premiumInEth - balanceInEth
+        const shortfall = premiumInUSD - balanceInUSDC
         throw new Error(
-          `❌ Insufficient funds!\n\n` +
-          `You have: ${balanceInEth.toFixed(6)} ETH\n` +
-          `Premium requires: ${premiumInEth.toFixed(6)} ETH ($${premiumInUSD.toFixed(2)})\n` +
-          `Need: ${shortfall.toFixed(6)} ETH more\n\n` +
-          `Make sure you have sufficient ETH in your wallet.`
+          `❌ Insufficient USDC balance!\n\n` +
+          `You have: ${balanceInUSDC.toFixed(2)} USDC\n` +
+          `Premium requires: ${premiumInUSD.toFixed(2)} USDC\n` +
+          `Need: ${shortfall.toFixed(2)} USDC more\n\n` +
+          `Make sure you have sufficient USDC in your wallet.`
         )
       }
       
-      console.log('Sending to backend address:', backendAddress)
-      console.log('Amount:', premiumInEth.toFixed(6), 'ETH', `($${premiumInUSD.toFixed(2)} USD)`)
+      // Check current allowance
+      const currentAllowance = await usdcContract.allowance(account, backendAddress)
       
-      // Get network info
-      const network = await provider.getNetwork()
-      console.log('Current network chainId:', network.chainId.toString())
-      console.log('Network name:', network.name)
+      // If allowance is insufficient, approve first
+      if (currentAllowance < premiumAmount) {
+        console.log('Approving USDC spend...')
+        const approveTx = await usdcContract.approve(backendAddress, premiumAmount)
+        console.log('Approve transaction sent:', approveTx.hash)
+        await approveTx.wait()
+        console.log('Approve transaction confirmed')
+      }
       
-      // Send transaction with explicit parameters
-      const tx = await signer.sendTransaction({
-        to: backendAddress,
-        value: premiumAmount,
-      })
+      console.log('Transferring USDC to backend address:', backendAddress)
+      console.log('Amount:', premiumInUSD.toFixed(2), 'USDC')
+      
+      // Transfer USDC
+      const tx = await usdcContract.transfer(backendAddress, premiumAmount)
 
       console.log('Transaction sent:', tx.hash)
       const receipt = await tx.wait()
@@ -277,32 +390,6 @@ function App() {
     fetchBackendWallet()
   }, [])
 
-  // Fetch current ETH price in USD from backend (Pyth Network)
-  useEffect(() => {
-    const fetchEthPrice = async () => {
-      try {
-        const response = await fetch('http://localhost:5000/eth-price')
-        if (response.ok) {
-          const data = await response.json()
-          const price = data.price
-          if (price) {
-            setEthPrice(price)
-            console.log('✅ ETH price fetched:', price)
-          }
-        } else {
-          console.warn('ETH price not available yet from backend')
-        }
-      } catch (err) {
-        console.error('Error fetching ETH price:', err)
-      }
-    }
-    
-    // Fetch immediately
-    fetchEthPrice()
-    // Refresh ETH price every 5 seconds (same as SOL price)
-    const interval = setInterval(fetchEthPrice, 5000)
-    return () => clearInterval(interval)
-  }, [])
 
   // Auto-calculate premium when form data changes
   useEffect(() => {
@@ -675,17 +762,15 @@ function App() {
                           <div>
                             <p className="text-blue-400 text-sm font-semibold">Ready to Purchase</p>
                             <p className="text-gray-400 text-xs mt-1">
-                              Premium: {ethPrice ? (parseFloat(calculatedPremium) / ethPrice).toFixed(6) + ' ETH' : 'Calculating...'}
+                              Premium: {calculatedPremium ? parseFloat(calculatedPremium).toFixed(2) + ' USDC' : 'Calculating...'}
                             </p>
                           </div>
                           <div className="text-right">
                             <p className="text-white text-lg font-bold">${calculatedPremium}</p>
                             <p className="text-gray-400 text-xs">Coverage: ${formatUSD(formData.insuranceAmount)}</p>
-                            {ethPrice && (
-                              <p className="text-gray-500 text-xs mt-1">
-                                ETH Price: ${ethPrice.toFixed(2)}
-                              </p>
-                            )}
+                            <p className="text-gray-500 text-xs mt-1">
+                              Pay with USDC on Base
+                            </p>
                           </div>
                         </div>
                         <button

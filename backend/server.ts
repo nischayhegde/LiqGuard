@@ -16,6 +16,14 @@ const PORT = process.env.PORT || 5000;
 const RPC_URL = process.env.RPC_URL || 'https://mainnet.base.org'; // Base mainnet (default)
 const SENDER_WALLET_PRIVATE_KEY = process.env.SENDER_WALLET_PRIVATE_KEY || '';
 const SENDER_WALLET_ADDRESS = process.env.SENDER_WALLET_ADDRESS || '';
+// USDC contract address on Base mainnet
+const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+// USDC ABI (minimal - just transfer function)
+const USDC_ABI = [
+  'function transfer(address to, uint256 amount) returns (bool)',
+  'function balanceOf(address account) view returns (uint256)',
+  'function decimals() view returns (uint8)'
+];
 
 // Global state
 let currentSolPrice: number | null = null;
@@ -263,25 +271,33 @@ async function resolveLiquidation(policy: typeof activePolicies[0], currentPrice
     const userAddress = policy.userWalletAddress;
     const insuranceAmount = policy.insuranceAmount;
     
-    // Convert USD to ETH (simplified - in production use oracle or USDC)
-    const ethPrice = currentSolPrice || 2000; // Use SOL price as proxy for ETH
-    const amountInEth = insuranceAmount / ethPrice;
-    const amountWei = ethers.parseEther(amountInEth.toFixed(18));
+    // Convert USD to USDC (USDC has 6 decimals)
+    // 1 USD = 1 USDC, so we just need to convert to USDC units
+    const amountInUSDC = ethers.parseUnits(insuranceAmount.toFixed(6), 6);
     
-    console.log(`💰 Sending payout:`);
+    console.log(`💰 Sending USDC payout:`);
     console.log(`   To: ${userAddress}`);
-    console.log(`   Amount: $${insuranceAmount} (≈ ${amountInEth.toFixed(6)} ETH)`);
+    console.log(`   Amount: $${insuranceAmount} USDC`);
     
-    // Send transaction
-    const tx = await senderWallet.sendTransaction({
-      to: userAddress,
-      value: amountWei,
-    });
+    // Get USDC contract instance
+    const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, senderWallet);
+    
+    // Check balance
+    const balance = await usdcContract.balanceOf(senderWallet.address);
+    console.log(`   Backend USDC balance: ${ethers.formatUnits(balance, 6)} USDC`);
+    
+    if (balance < amountInUSDC) {
+      console.error(`❌ Insufficient USDC balance. Need ${insuranceAmount} USDC, have ${ethers.formatUnits(balance, 6)} USDC`);
+      return;
+    }
+    
+    // Send USDC transfer transaction
+    const tx = await usdcContract.transfer(userAddress, amountInUSDC);
     
     console.log(`   Transaction: ${tx.hash}`);
     const receipt = await tx.wait();
     if (receipt) {
-      console.log(`✅ Payout sent! Block: ${receipt.blockNumber}`);
+      console.log(`✅ USDC payout sent! Block: ${receipt.blockNumber}`);
     }
     
     // Update policy status
